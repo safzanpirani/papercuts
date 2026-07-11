@@ -1,0 +1,19 @@
+{
+  "name": "papercuts-cli",
+  "version": "0.1.0",
+  "description": "A tiny CLI for agents to log the small frustrations they hit while working",
+  "type": "module",
+  "bin": {
+    "papercuts": "./src/cli.ts"
+  },
+  "scripts": {
+    "papercuts": "bun run src/cli.ts",
+    "build": "bun build --compile src/cli.ts --outfile dist/papercuts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  }
+}

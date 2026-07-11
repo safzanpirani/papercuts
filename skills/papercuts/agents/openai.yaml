@@ -1,0 +1,4 @@
+interface:
+  display_name: "Papercuts"
+  short_description: "Log small agent workflow frustrations"
+  default_prompt: "Use $papercuts to record the friction I just encountered."
