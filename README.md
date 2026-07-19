@@ -32,13 +32,17 @@ The docs linked to a removed API endpoint.
 
 ## Install
 
+Requires [Bun](https://bun.sh) — the CLI uses Bun APIs and won't run under plain
+Node. (For Bun-less machines, see the compiled-binary option below.)
+
 ```sh
-cd ~/Development/papercuts
+git clone https://github.com/safzanpirani/papercuts.git
+cd papercuts
 bun install
 bun link
 
 # Make the companion skill discoverable to agents.
-ln -s ~/Development/papercuts/skills/papercuts ~/.agents/skills/papercuts
+ln -s "$PWD/skills/papercuts" ~/.agents/skills/papercuts
 ```
 
 For machines and containers without bun, compile a self-contained binary and
