@@ -3,6 +3,19 @@
   "version": "0.1.0",
   "description": "A tiny CLI for agents to log the small frustrations they hit while working",
   "type": "module",
+  "license": "MIT",
+  "author": "Safzan Pirani",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/safzanpirani/papercuts.git"
+  },
+  "keywords": [
+    "cli",
+    "agents",
+    "ai",
+    "papercuts",
+    "friction-log"
+  ],
   "bin": {
     "papercuts": "./src/cli.ts"
   },
