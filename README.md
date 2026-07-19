@@ -1,9 +1,9 @@
 <h1 align="center">papercuts</h1>
 
 <p align="center">
-  A tiny CLI for AI agents to log the small frictions they hit while working —
-  dead-end tool calls, broken links, confusing setup, flaky commands, misleading
-  errors — so recurring pain becomes countable and easy to sand down later.
+  A tiny CLI that agents can use to complain about the bullshit they hit during
+  work — dead-end tool calls, broken links, flaky commands, misleading errors —
+  so recurring pain becomes countable and easy to sand down later.
 </p>
 
 ```sh
