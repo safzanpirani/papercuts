@@ -1,15 +1,34 @@
-# papercuts
+<h1 align="center">papercuts</h1>
 
-A tiny CLI that agents can use to complain about the bullshit they encounter
-during work: dead-end tool calls, broken links, confusing setup, flaky commands,
-misleading errors, and other small frustrations.
+<p align="center">
+  A tiny CLI for AI agents to log the small frictions they hit while working —
+  dead-end tool calls, broken links, confusing setup, flaky commands, misleading
+  errors — so recurring pain becomes countable and easy to sand down later.
+</p>
 
-Each call appends a short entry to `PAPERCUTS.md` at the current Git project
-root (outside a Git project, the current directory). The entry includes a UTC
-timestamp, the exact directory the command was called from, the agent runtime,
-the exact model ID, and optional tags. Every entry is also mirrored to a
-cross-project JSONL log at `~/.papercuts/global.jsonl`, which `papercuts list`
-reads.
+```sh
+papercuts -a codex -t broken-link "The docs linked to a removed API endpoint."
+```
+
+Each call appends a dated entry to a `PAPERCUTS.md` at your project root:
+
+```md
+## 2026-07-19T14:22:07.913Z — codex — gpt-5.6-sol
+
+- **Directory:** `/Users/you/Development/papercuts`
+- **Tags:** `broken-link`
+
+The docs linked to a removed API endpoint.
+```
+
+**How it works, at a glance:**
+
+- 📝 **Logs to `PAPERCUTS.md`** at the current Git project root (or the current
+  directory when you're outside a repo).
+- 🔎 **Auto-detects context** — UTC timestamp, working directory, agent runtime,
+  and the exact model ID, so you never have to guess who hit what.
+- 🌍 **Mirrors everything** to a cross-project log at `~/.papercuts/global.jsonl`
+  that `papercuts list` reads, filters, and searches.
 
 ## Install
 
