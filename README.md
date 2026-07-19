@@ -32,6 +32,17 @@ The docs linked to a removed API endpoint.
 
 ## Install
 
+### Just the skill
+
+To install only the companion skill (discoverable across Claude Code, Codex,
+Cline, and 40+ other agent runtimes):
+
+```sh
+npx skills add https://github.com/safzanpirani/papercuts -g
+```
+
+### The full CLI
+
 Requires [Bun](https://bun.sh) — the CLI uses Bun APIs and won't run under plain
 Node. (For Bun-less machines, see the compiled-binary option below.)
 
