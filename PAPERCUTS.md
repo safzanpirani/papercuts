@@ -17,3 +17,10 @@ While creating the companion skill, the generated SKILL.md template differed fro
 
 While verifying skill links in zsh, using 'path' as a loop variable silently replaced the shell's special PATH array, so subsequent ls and readlink commands were not found. Use a variable such as 'target' in zsh loops instead.
 
+## cf1734 · 2026-07-30T06:40:14.481Z — claude-code — claude-opus-5
+
+- **Directory:** `/Users/safzan/Development/papercuts`
+- **Tags:** `dx`
+
+Syncing a skill file to ~/.agents/skills: 'cp -f src dst' still prompted 'overwrite?' and left the file unchanged, because the shell's 'cp -i' alias wins over the later -f on this setup — and the failed copy looks like success unless you diff after. Use /bin/cp (or \cp) for scripted overwrites.
+

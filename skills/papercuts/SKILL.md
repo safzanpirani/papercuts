@@ -9,11 +9,22 @@ Record small friction immediately without interrupting the task.
 
 1. Write one or two sentences: what you were doing, what got in the way, and, when useful, a likely cause or fix.
 2. Identify both your agent runtime and exact model ID. Never shorten, generalize, or guess the model ID.
-3. Run `papercuts --agent <your-agent-name> --model <exact-model-id> "<message>"` from the directory where the friction occurred. Omit `--model` only when the runtime exposes the exact ID for automatic detection. When the friction fits an obvious category (for example `flaky-command`, `broken-link`, `docs`, `stale-cache`, `misleading-error`), add it with `--tag <category>` so recurring friction is countable.
-4. Continue the original task. Mention the papercut to the user only when it materially affects the result.
+3. Name the subject with `--about <tool>` whenever the friction belongs to something other than the repo you are standing in — a CLI, MCP server, service, or skill. Friction about a tool is almost always hit from a different repo, and without `--about` it is filed where nobody who maintains that tool will ever read it.
+4. Tag it with `--tag` from the canonical vocabulary below so recurring friction is countable. Run `papercuts tags` when unsure. Invent a new tag only when nothing fits.
+5. Run `papercuts --agent <your-agent-name> --model <exact-model-id> [--about <tool>] [--tag <tag>] "<message>"` from the directory where the friction occurred. Omit `--model` only when the runtime exposes the exact ID for automatic detection.
+6. If the CLI reports a similar open papercut, decide: same friction → `papercuts bump <id>` (it counts the repeat and you can drop your new entry from consideration); genuinely different → leave both.
+7. Continue the original task. Mention the papercut to the user only when it materially affects the result.
+
+Canonical tags: `broken-link`, `cleanup`, `config`, `deps`, `docs`, `dx`, `flaky-command`, `misleading-error`, `missing-tool`, `noisy-output`, `remote-ops`, `security`, `shell-quoting`, `slow-command`, `stale-cache`, `test-gap`, `tooling`, `upstream-bug`.
 
 Use this for missed or dead-end tool calls, broken links, confusing or undocumented setup, flaky commands, stale caches, misleading errors, and non-obvious gotchas.
 
+## Reviewing and closing them
+
+- `papercuts list` shows this project's **open** papercuts (`--all` for every project, `--about <tool>` for one subject, `--resolved` for closed ones).
+- `papercuts top [tag|about|project|agent|model]` ranks recurring friction by entries and total hits — the fastest way to find what is worth fixing.
+- `papercuts resolve <id> --note "<what fixed it>"` closes one after the underlying friction is gone. Do this when you fix something a papercut described; otherwise the log only grows and open friction becomes indistinguishable from fixed friction.
+
 Do not use `PAPERCUTS.md` as a substitute for a real bug report, tracked work, or the final account of what was accomplished. Never include secrets, tokens, private user data, or raw credentials.
 
-The CLI writes to `PAPERCUTS.md` at the enclosing Git root and records the timestamp, invocation directory, agent runtime, and exact model ID. If `papercuts` is unavailable, continue the task and briefly report that the logging tool is not installed; do not create a different log format by hand.
+The CLI writes to `PAPERCUTS.md` at the enclosing Git root and records a short ID, timestamp, invocation directory, subject, agent runtime, and exact model ID. If `papercuts` is unavailable, continue the task and briefly report that the logging tool is not installed; do not create a different log format by hand.

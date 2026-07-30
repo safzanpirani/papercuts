@@ -1,5 +1,6 @@
-import { appendFile, mkdir, open, readdir, readFile, stat } from "node:fs/promises";
+import { appendFile, mkdir, open, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { existsSync, createReadStream } from "node:fs";
+import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 import { homedir } from "node:os";
 import { dirname, join, parse, resolve } from "node:path";
@@ -13,13 +14,111 @@ Small, non-blocking frictions encountered by agents while working. Review this f
 `;
 
 export interface Papercut {
+  id: string;
   timestamp: string;
   agent: string;
   modelId: string;
   directory: string;
+  /** What the friction is *about* (tool, CLI, service), independent of where it was hit. */
+  about?: string;
   message: string;
   tags: string[];
+  status: "open" | "resolved";
+  occurrences: number;
+  lastSeen?: string;
+  resolvedAt?: string;
+  resolution?: string;
   file: string;
+}
+
+/**
+ * Closed tag vocabulary. Free-form tags decay into near-duplicates
+ * (fleet/fleet-cli/remote-ops), which makes recurring friction uncountable.
+ */
+export const CANONICAL_TAGS = [
+  "broken-link",
+  "cleanup",
+  "config",
+  "deps",
+  "docs",
+  "dx",
+  "flaky-command",
+  "misleading-error",
+  "missing-tool",
+  "noisy-output",
+  "remote-ops",
+  "security",
+  "shell-quoting",
+  "slow-command",
+  "stale-cache",
+  "test-gap",
+  "tooling",
+  "upstream-bug",
+] as const;
+
+const TAG_ALIASES: Record<string, string> = {
+  api: "upstream-bug",
+  auth: "config",
+  "broken-feature": "tooling",
+  "broken-tool": "tooling",
+  cli: "tooling",
+  fleet: "remote-ops",
+  "fleet-cli": "remote-ops",
+  "github-connector": "tooling",
+  "gpu-ops": "remote-ops",
+  "import-path": "config",
+  infra: "remote-ops",
+  "misleading-output": "misleading-error",
+  noisy: "noisy-output",
+  observability: "dx",
+  performance: "slow-command",
+  "python-venv": "config",
+  remote: "remote-ops",
+  shell: "shell-quoting",
+  ssh: "remote-ops",
+  testing: "test-gap",
+  tests: "test-gap",
+  validation: "test-gap",
+  windows: "remote-ops",
+  workflow: "dx",
+};
+
+/** Map a tag onto the canonical vocabulary; unknown tags pass through unchanged. */
+export function canonicalTag(tag: string): string {
+  const slug = tag.trim().toLowerCase().replace(/[\s_]+/g, "-");
+  return TAG_ALIASES[slug] ?? slug;
+}
+
+export function normalizeTags(tags: string[]): { tags: string[]; unknown: string[] } {
+  const normalized = [...new Set(tags.map(canonicalTag).filter(Boolean))];
+  return {
+    tags: normalized,
+    unknown: normalized.filter((tag) => !(CANONICAL_TAGS as readonly string[]).includes(tag)),
+  };
+}
+
+/** Nearest canonical tag by character-bigram overlap, for "did you mean" hints. */
+export function suggestTag(tag: string): string | undefined {
+  const bigrams = (value: string) =>
+    new Set(Array.from({ length: Math.max(value.length - 1, 0) }, (_, i) => value.slice(i, i + 2)));
+  const target = bigrams(tag);
+  let best: { tag: string; score: number } | undefined;
+  for (const candidate of CANONICAL_TAGS) {
+    const other = bigrams(candidate);
+    const shared = [...target].filter((gram) => other.has(gram)).length;
+    const score = shared / Math.max(target.size + other.size - shared, 1);
+    if (!best || score > best.score) best = { tag: candidate, score };
+  }
+  return best && best.score >= 0.3 ? best.tag : undefined;
+}
+
+/** Stable short ID derived from the entry's immutable fields. */
+export function entryId(timestamp: string, message: string): string {
+  return createHash("sha1").update(`${timestamp}\n${message.trim()}`).digest("hex").slice(0, 6);
+}
+
+export function normalizeAbout(about: string): string {
+  return about.trim().toLowerCase().replace(/[\s_]+/g, "-");
 }
 
 /** Find the enclosing Git project without requiring the git executable. */
@@ -215,14 +314,168 @@ export async function readGlobalEntries(
   for (const line of content.split("\n")) {
     if (!line.trim()) continue;
     try {
-      const record = JSON.parse(line) as Papercut;
+      const record = JSON.parse(line) as Partial<Papercut>;
       if (typeof record.timestamp !== "string" || typeof record.message !== "string") continue;
-      entries.push({ ...record, tags: Array.isArray(record.tags) ? record.tags : [] });
+      entries.push({
+        ...(record as Papercut),
+        // Entries written before the lifecycle fields existed get their ID
+        // derived on read, so old logs need no migration.
+        id: record.id ?? entryId(record.timestamp, record.message),
+        tags: Array.isArray(record.tags) ? record.tags : [],
+        status: record.status === "resolved" ? "resolved" : "open",
+        occurrences: typeof record.occurrences === "number" && record.occurrences > 0 ? record.occurrences : 1,
+      });
     } catch {
       // Skip a torn line from a concurrent write.
     }
   }
   return entries;
+}
+
+/** Rewrite the global mirror in place (read-modify-write via a temp file + rename). */
+export async function writeGlobalEntries(
+  entries: Papercut[],
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  const globalFile = resolveGlobalFile(environment);
+  if (!globalFile) throw new Error("global mirror is disabled; nothing to update");
+  const temporary = `${globalFile}.tmp-${process.pid}`;
+  await mkdir(dirname(globalFile), { recursive: true });
+  await writeFile(temporary, entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""), "utf8");
+  await rename(temporary, globalFile);
+}
+
+const STOPWORDS = new Set(
+  ("a an the and or but so then than that this these those it its is was were be been being of in on at to for from with " +
+    "while during after before because when where which what why how i we my our not no did does do done had has have " +
+    "as by if into out up down over under again only just also very can could would should still even").split(" "),
+);
+
+function significantWords(message: string): Set<string> {
+  return new Set(
+    message
+      .toLowerCase()
+      .split(/[^a-z0-9._/-]+/)
+      .filter((word) => word.length > 2 && !STOPWORDS.has(word)),
+  );
+}
+
+/**
+ * Overlap coefficient (shared / smaller vocabulary), boosted when both entries
+ * name the same subject. Overlap rather than Jaccard because a terse repeat of a
+ * thoroughly-described papercut is still the same papercut.
+ */
+export function similarity(a: Papercut | { message: string; about?: string }, b: Papercut): number {
+  const left = significantWords(a.message);
+  const right = significantWords(b.message);
+  const shared = [...left].filter((word) => right.has(word)).length;
+  // Two very short messages can overlap fully by accident; demand real evidence.
+  if (shared < 4) return 0;
+  const base = shared / Math.max(Math.min(left.size, right.size), 1);
+  const sameSubject = a.about && b.about && a.about === b.about;
+  return sameSubject ? Math.min(base * 1.2, 1) : base;
+}
+
+export function findSimilar(
+  entries: Papercut[],
+  candidate: { message: string; about?: string },
+  threshold = 0.5,
+): { entry: Papercut; score: number } | undefined {
+  let best: { entry: Papercut; score: number } | undefined;
+  for (const entry of entries) {
+    const score = similarity(candidate, entry);
+    if (score >= threshold && (!best || score > best.score)) best = { entry, score };
+  }
+  return best;
+}
+
+/**
+ * Add metadata bullets to an entry already written to a Markdown log. Matches on
+ * the ID when present and falls back to the timestamp for pre-ID entries.
+ */
+export async function annotateMarkdownEntry(
+  file: string,
+  entry: Papercut,
+  bullets: string[],
+): Promise<boolean> {
+  let content: string;
+  try {
+    content = await readFile(file, "utf8");
+  } catch {
+    return false;
+  }
+
+  const lines = content.split("\n");
+  const headingIndex = lines.findIndex(
+    (line) => line.startsWith("## ") && (line.includes(`## ${entry.id} `) || line.includes(entry.timestamp)),
+  );
+  if (headingIndex === -1) return false;
+
+  // Bullets sit in one contiguous block after the heading; append to its end.
+  let insertAt = headingIndex + 1;
+  while (insertAt < lines.length && !lines[insertAt]!.startsWith("- **")) {
+    if (lines[insertAt]!.startsWith("## ")) return false;
+    insertAt++;
+  }
+  while (insertAt < lines.length && lines[insertAt]!.startsWith("- **")) insertAt++;
+
+  lines.splice(insertAt, 0, ...bullets);
+  await writeFile(file, lines.join("\n"), "utf8");
+  return true;
+}
+
+async function updateEntry(
+  id: string,
+  apply: (entry: Papercut) => { entry: Papercut; bullets: string[] },
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<Papercut> {
+  const entries = await readGlobalEntries(environment);
+  const matches = entries.filter((entry) => entry.id === id || entry.id.startsWith(id));
+  if (!matches.length) throw new Error(`no papercut with ID ${id}`);
+  if (matches.length > 1) throw new Error(`ID ${id} is ambiguous (${matches.map((e) => e.id).join(", ")})`);
+
+  const target = matches[0]!;
+  const { entry, bullets } = apply(target);
+  await writeGlobalEntries(
+    entries.map((existing) => (existing.id === target.id ? entry : existing)),
+    environment,
+  );
+  if (bullets.length) await annotateMarkdownEntry(entry.file, entry, bullets);
+  return entry;
+}
+
+export async function resolvePapercut(
+  id: string,
+  options: { note?: string; now?: Date; environment?: NodeJS.ProcessEnv } = {},
+): Promise<Papercut> {
+  const resolvedAt = (options.now ?? new Date()).toISOString();
+  return updateEntry(
+    id,
+    (entry) => {
+      if (entry.status === "resolved") throw new Error(`papercut ${entry.id} is already resolved`);
+      const note = options.note?.trim();
+      return {
+        entry: { ...entry, status: "resolved", resolvedAt, resolution: note },
+        bullets: [`- **Resolved:** ${resolvedAt}${note ? ` — ${oneLine(note)}` : ""}`],
+      };
+    },
+    options.environment,
+  );
+}
+
+export async function bumpPapercut(
+  id: string,
+  options: { now?: Date; environment?: NodeJS.ProcessEnv } = {},
+): Promise<Papercut> {
+  const lastSeen = (options.now ?? new Date()).toISOString();
+  return updateEntry(
+    id,
+    (entry) => ({
+      entry: { ...entry, occurrences: entry.occurrences + 1, lastSeen, status: "open" },
+      bullets: [`- **Hit again:** ${lastSeen} (${entry.occurrences + 1} total)`],
+    }),
+    options.environment,
+  );
 }
 
 function oneLine(value: string): string {
@@ -239,16 +492,36 @@ function sanitizeMessage(message: string): string {
 }
 
 export function formatEntry(entry: Omit<Papercut, "file">): string {
-  const tags = entry.tags.length
-    ? `\n- **Tags:** ${entry.tags.map(inlineCode).join(", ")}`
-    : "";
-  return `## ${entry.timestamp} — ${oneLine(entry.agent)} — ${oneLine(entry.modelId)}
+  const bullets = [`- **Directory:** ${inlineCode(entry.directory)}`];
+  if (entry.about) bullets.push(`- **About:** ${inlineCode(entry.about)}`);
+  if (entry.tags.length) bullets.push(`- **Tags:** ${entry.tags.map(inlineCode).join(", ")}`);
+  return `## ${entry.id} · ${entry.timestamp} — ${oneLine(entry.agent)} — ${oneLine(entry.modelId)}
 
-- **Directory:** ${inlineCode(entry.directory)}${tags}
+${bullets.join("\n")}
 
 ${sanitizeMessage(entry.message)}
 
 `;
+}
+
+/**
+ * Optional `about` → repo map at ~/.papercuts/subjects.json, e.g.
+ * {"fleet": "/Users/me/Development/fleet"}. Friction about a tool is usually hit
+ * from some *other* repo, so mirror it where the tool's maintainer will see it.
+ */
+async function subjectLogFile(
+  about: string | undefined,
+  environment: NodeJS.ProcessEnv,
+): Promise<string | undefined> {
+  if (!about) return undefined;
+  const mapFile = join(environment.HOME?.trim() || homedir(), ".papercuts", "subjects.json");
+  try {
+    const map = JSON.parse(await readFile(mapFile, "utf8")) as Record<string, string>;
+    const directory = map[about]?.trim();
+    return directory ? join(resolve(directory), LOG_NAME) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function recordPapercut(options: {
@@ -256,6 +529,7 @@ export async function recordPapercut(options: {
   directory?: string;
   agent?: string;
   modelId?: string;
+  about?: string;
   tags?: string[];
   file?: string;
   environment?: NodeJS.ProcessEnv;
@@ -267,13 +541,18 @@ export async function recordPapercut(options: {
   const directory = resolve(options.directory ?? process.cwd());
   const environment = options.environment ?? process.env;
   const file = resolveLogFile(directory, options.file, environment);
+  const timestamp = (options.now ?? new Date()).toISOString();
   const entry: Papercut = {
-    timestamp: (options.now ?? new Date()).toISOString(),
+    id: entryId(timestamp, message),
+    timestamp,
     agent: detectAgent(environment, options.agent),
     modelId: await detectModelId(environment, options.modelId, directory),
     directory,
+    about: options.about ? normalizeAbout(options.about) : undefined,
     message,
-    tags: [...new Set((options.tags ?? []).map((tag) => tag.trim()).filter(Boolean))],
+    tags: normalizeTags(options.tags ?? []).tags,
+    status: "open",
+    occurrences: 1,
     file,
   };
 
@@ -292,6 +571,13 @@ export async function recordPapercut(options: {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     const prefix = (await stat(file)).size === 0 ? HEADER : "";
     await appendFile(file, prefix + text, "utf8");
+  }
+
+  const subjectFile = await subjectLogFile(entry.about, environment);
+  if (subjectFile && resolve(subjectFile) !== resolve(file)) {
+    await mkdir(dirname(subjectFile), { recursive: true });
+    const exists = existsSync(subjectFile) && (await stat(subjectFile)).size > 0;
+    await appendFile(subjectFile, (exists ? "" : HEADER) + text, "utf8");
   }
 
   const globalFile = resolveGlobalFile(environment);

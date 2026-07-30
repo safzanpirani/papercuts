@@ -3,13 +3,20 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  bumpPapercut,
+  canonicalTag,
   detectAgent,
   detectModelId,
+  entryId,
   findProjectRoot,
+  findSimilar,
+  normalizeTags,
   readGlobalEntries,
   recordPapercut,
   resolveGlobalFile,
   resolveLogFile,
+  resolvePapercut,
+  suggestTag,
 } from "./core.ts";
 
 const temporaryDirectories: string[] = [];
@@ -114,6 +121,117 @@ describe("global mirror", () => {
     expect(resolveGlobalFile({ HOME: home })).toBe(join(home, ".papercuts", "global.jsonl"));
     expect(resolveGlobalFile({ PAPERCUTS_GLOBAL_FILE: "off" })).toBeUndefined();
     expect(await readGlobalEntries({ HOME: home })).toEqual([]);
+  });
+});
+
+describe("tags", () => {
+  test("folds known aliases onto the canonical vocabulary", () => {
+    expect(canonicalTag("Fleet-CLI")).toBe("remote-ops");
+    expect(canonicalTag("misleading-output")).toBe("misleading-error");
+    expect(canonicalTag("shell_quoting")).toBe("shell-quoting");
+  });
+
+  test("reports non-canonical tags without dropping them", () => {
+    const result = normalizeTags(["docs", "modal", "modal"]);
+    expect(result.tags).toEqual(["docs", "modal"]);
+    expect(result.unknown).toEqual(["modal"]);
+    expect(suggestTag("doc")).toBe("docs");
+  });
+});
+
+describe("lifecycle", () => {
+  async function project(): Promise<{ root: string; environment: NodeJS.ProcessEnv }> {
+    const root = await temporaryDirectory();
+    await mkdir(join(root, ".git"));
+    const globalFile = join(await temporaryDirectory(), "global.jsonl");
+    return { root, environment: { PAPERCUTS_GLOBAL_FILE: globalFile } };
+  }
+
+  test("assigns a stable ID and open status, and resolves with a note", async () => {
+    const { root, environment } = await project();
+    const entry = await recordPapercut({
+      directory: root,
+      agent: "a",
+      modelId: "m",
+      message: "fleet exec swallowed a flag placed after the selector.",
+      about: "Fleet",
+      tags: ["fleet-cli"],
+      environment,
+    });
+
+    expect(entry.id).toBe(entryId(entry.timestamp, entry.message));
+    expect(entry.status).toBe("open");
+    expect(entry.about).toBe("fleet");
+    expect(entry.tags).toEqual(["remote-ops"]);
+
+    const markdown = await readFile(entry.file, "utf8");
+    expect(markdown).toContain(`## ${entry.id} · ${entry.timestamp}`);
+    expect(markdown).toContain("**About:** `fleet`");
+
+    const resolved = await resolvePapercut(entry.id, { note: "Added a targeted error in cli.ts.", environment });
+    expect(resolved.status).toBe("resolved");
+    expect((await readGlobalEntries(environment))[0]!.status).toBe("resolved");
+    expect(await readFile(entry.file, "utf8")).toContain("**Resolved:**");
+    expect(await readFile(entry.file, "utf8")).toContain("Added a targeted error in cli.ts.");
+
+    await expect(resolvePapercut(entry.id, { environment })).rejects.toThrow("already resolved");
+  });
+
+  test("bump counts a repeat instead of adding a near-duplicate entry", async () => {
+    const { root, environment } = await project();
+    const entry = await recordPapercut({
+      directory: root,
+      agent: "a",
+      modelId: "m",
+      message: "The fff MCP grep failed immediately with Transport closed; fell back to ripgrep.",
+      environment,
+    });
+
+    const bumped = await bumpPapercut(entry.id.slice(0, 4), { environment });
+    expect(bumped.occurrences).toBe(2);
+    expect(bumped.lastSeen).toBeString();
+    expect(await readFile(entry.file, "utf8")).toContain("**Hit again:**");
+    expect(await readGlobalEntries(environment)).toHaveLength(1);
+  });
+
+  test("finds a similar open entry for a near-duplicate message", async () => {
+    const { root, environment } = await project();
+    await recordPapercut({
+      directory: root,
+      agent: "a",
+      modelId: "m",
+      message: "fleet spawn silently forwarded --name after the command into the remote python argv.",
+      about: "fleet",
+      environment,
+    });
+    const entries = await readGlobalEntries(environment);
+
+    expect(
+      findSimilar(entries, {
+        message: "fleet spawn forwarded its documented --cwd option into the remote pytest argv.",
+        about: "fleet",
+      })?.entry.id,
+    ).toBe(entries[0]!.id);
+    expect(findSimilar(entries, { message: "The portfolio README is empty so pnpm dev fails." })).toBeUndefined();
+  });
+
+  test("derives IDs for entries written before the lifecycle fields existed", async () => {
+    const globalFile = join(await temporaryDirectory(), "global.jsonl");
+    const legacy = {
+      timestamp: "2026-07-13T15:36:36.645Z",
+      agent: "claude-code",
+      modelId: "claude-opus-4-8",
+      directory: "/tmp/legacy",
+      message: "A stale systemd Description made a plain restart bug look deliberate.",
+      tags: ["misleading-error"],
+      file: "/tmp/legacy/PAPERCUTS.md",
+    };
+    await writeFile(globalFile, `${JSON.stringify(legacy)}\n`);
+
+    const [entry] = await readGlobalEntries({ PAPERCUTS_GLOBAL_FILE: globalFile });
+    expect(entry!.id).toBe(entryId(legacy.timestamp, legacy.message));
+    expect(entry!.status).toBe("open");
+    expect(entry!.occurrences).toBe(1);
   });
 });
 

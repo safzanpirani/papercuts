@@ -69,10 +69,17 @@ cp dist/papercuts ~/.local/bin/
 ```sh
 papercuts --agent codex --model gpt-5.6-sol "The docs linked to a removed endpoint."
 papercuts -a claude-code -m claude-opus-4-6 -t flaky-command "The test command assumes a different working directory."
+papercuts -b fleet -t remote-ops "fleet cp accepts one source file, but the docs show several."
 echo "The setup step was undocumented." | PAPERCUTS_MODEL_ID=gemini-2.5-pro papercuts
-papercuts list                 # this project's papercuts, oldest → newest
+papercuts list                 # this project's OPEN papercuts, oldest → newest
 papercuts list --all --json    # every project, machine-readable
 papercuts list -t flaky-command --since 2026-07-01
+papercuts list -b fleet --all  # everything logged about one tool
+papercuts top about --all      # what recurs most, by subject
+papercuts top tag --all -n 10
+papercuts tags                 # canonical vocabulary + what's in use
+papercuts bump 29558a          # hit the same friction again
+papercuts resolve 29558a --note "Added a targeted error in cli.ts."
 papercuts path
 ```
 
@@ -83,7 +90,27 @@ project. Use `--agent`/`-a` and `--model`/`-m`, or `PAPERCUTS_AGENT` and
 `PAPERCUTS_MODEL_ID`, to set exact values explicitly.
 
 Tag entries with `--tag`/`-t` (repeatable, comma-separated values allowed) so
-recurring friction is countable across entries.
+recurring friction is countable across entries. Tags are folded onto a closed
+vocabulary (`papercuts tags`) — `fleet-cli` and `ssh` both become `remote-ops`,
+so near-duplicate tags cannot fragment the counts. A tag outside the vocabulary
+is still stored, with a warning and a suggestion.
+
+Name the subject with `--about`/`-b` when the friction belongs to a tool rather
+than the repo you are standing in. Friction about a CLI or MCP server is usually
+hit from some other project, so `--about` is what lets `papercuts top about`
+group it and `papercuts list -b <tool>` retrieve it. Map a subject to the repo
+that owns it in `~/.papercuts/subjects.json` and the entry is also filed there:
+
+```json
+{ "fleet": "/Users/me/Development/fleet" }
+```
+
+Each entry carries a short ID and a status. `papercuts list` shows open ones by
+default; `papercuts resolve <id> --note "<fix>"` closes one and annotates both
+the Markdown log and the mirror, and `papercuts bump <id>` counts a repeat
+instead of appending a near-duplicate. `add` compares each new message against
+open entries and points at a likely match. Entries written before IDs and
+statuses existed get both derived on read, so old logs keep working unchanged.
 
 Use `--file` or `PAPERCUTS_FILE` to override the per-project destination. Use
 `PAPERCUTS_GLOBAL_FILE` to relocate the cross-project mirror, or set it to
