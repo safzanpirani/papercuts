@@ -86,8 +86,11 @@ papercuts path
 Agent detection is automatic for common runtimes. Model detection checks
 runtime-specific environment variables, the active Codex rollout identified by
 `CODEX_THREAD_ID`, and the newest Claude Code transcript for the current
-project. Use `--agent`/`-a` and `--model`/`-m`, or `PAPERCUTS_AGENT` and
-`PAPERCUTS_MODEL_ID`, to set exact values explicitly.
+project. Codex date partitions remain a newest-first serial scan. Claude transcript
+metadata uses an eight-file stat pool, skips files that disappear between listing and
+stat, and sorts by mtime with a stable path tie-break, so completion timing cannot
+change which transcript wins. Use `--agent`/`-a` and `--model`/`-m`, or
+`PAPERCUTS_AGENT` and `PAPERCUTS_MODEL_ID`, to set exact values explicitly.
 
 Tag entries with `--tag`/`-t` (repeatable, comma-separated values allowed) so
 recurring friction is countable across entries. Tags are folded onto a closed
@@ -114,7 +117,11 @@ statuses existed get both derived on read, so old logs keep working unchanged.
 
 Use `--file` or `PAPERCUTS_FILE` to override the per-project destination. Use
 `PAPERCUTS_GLOBAL_FILE` to relocate the cross-project mirror, or set it to
-`off` to disable mirroring.
+`off` to disable mirroring. Papercuts always completes the primary Markdown append
+first. After that succeeds, it writes distinct subject and global mirror destinations
+concurrently. Duplicate resolved paths receive one write, which prevents a subject map
+and global override from double-appending the same file. Lifecycle updates such as
+`resolve` and `bump` remain serial read-modify-write operations.
 
 The companion skill is intentionally small: it teaches an agent to record a
 papercut immediately, in one or two useful sentences, without interrupting the

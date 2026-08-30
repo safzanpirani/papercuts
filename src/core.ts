@@ -6,12 +6,34 @@ import { homedir } from "node:os";
 import { dirname, join, parse, resolve } from "node:path";
 
 export const LOG_NAME = "PAPERCUTS.md";
+const TRANSCRIPT_STAT_PARALLELISM = 8;
 
 const HEADER = `# PAPERCUTS
 
 Small, non-blocking frictions encountered by agents while working. Review this file periodically and sand them down.
 
 `;
+
+/** Run independent work with a fixed ceiling while preserving input order. */
+export async function mapPool<T, R>(
+  items: readonly T[],
+  maxParallel: number,
+  run: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (!Number.isInteger(maxParallel) || maxParallel < 1)
+    throw new Error(`maxParallel must be an integer ≥ 1 (got ${maxParallel})`);
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await run(items[index]!, index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(maxParallel, items.length) }, worker));
+  return results;
+}
 
 export interface Papercut {
   id: string;
@@ -215,6 +237,59 @@ function claudeProjectSlug(directory: string): string {
   return directory.replace(/[^a-zA-Z0-9]/g, "-");
 }
 
+export interface TranscriptFile {
+  file: string;
+  modifiedMs: number;
+}
+
+/** Collect Claude transcripts deterministically. Stats run through an eight-slot
+ * pool; files that disappear after listing are skipped without masking other IO
+ * errors. The existing newest-mtime-first order gets a stable path tie-break. */
+export async function collectTranscriptFiles(
+  projectDirectories: string[],
+  options: {
+    maxParallel?: number;
+    statFile?: (file: string) => Promise<{ mtimeMs: number }>;
+  } = {},
+): Promise<TranscriptFile[]> {
+  const listed = await Promise.all(projectDirectories.map(async (projectDirectory) =>
+    (await directoryEntriesNewestFirst(projectDirectory))
+      .filter((name) => name.endsWith(".jsonl"))
+      .map((name) => join(projectDirectory, name)),
+  ));
+  const files = listed.flat();
+  const statFile = options.statFile ?? stat;
+  const transcripts = await mapPool(files, options.maxParallel ?? TRANSCRIPT_STAT_PARALLELISM, async (file) => {
+    try {
+      return { file, modifiedMs: (await statFile(file)).mtimeMs };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  });
+  return transcripts
+    .filter((transcript): transcript is TranscriptFile => transcript !== undefined)
+    .sort((a, b) => b.modifiedMs - a.modifiedMs || a.file.localeCompare(b.file));
+}
+
+export async function modelFromClaudeTranscripts(
+  transcripts: readonly TranscriptFile[],
+): Promise<string | undefined> {
+  for (const transcript of transcripts) {
+    try {
+      const model = await lastJsonLineValue(transcript.file, '"model":', (record) => {
+        const value = (record as { message?: { model?: unknown } }).message?.model;
+        return typeof value === "string" && value !== "<synthetic>" ? value : undefined;
+      });
+      if (model) return model;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+  }
+  return undefined;
+}
+
 async function modelFromClaudeSession(
   environment: NodeJS.ProcessEnv,
   directory: string,
@@ -224,31 +299,10 @@ async function modelFromClaudeSession(
   const configDirectory =
     environment.CLAUDE_CONFIG_DIR?.trim() || join(environment.HOME?.trim() || homedir(), ".claude");
   const candidates = [...new Set([resolve(directory), findProjectRoot(directory)])];
-
-  const transcripts: { file: string; modifiedMs: number }[] = [];
-  for (const candidate of candidates) {
-    const projectDirectory = join(configDirectory, "projects", claudeProjectSlug(candidate));
-    for (const name of await directoryEntriesNewestFirst(projectDirectory)) {
-      if (!name.endsWith(".jsonl")) continue;
-      const file = join(projectDirectory, name);
-      try {
-        transcripts.push({ file, modifiedMs: (await stat(file)).mtimeMs });
-      } catch {
-        // A transcript can disappear between listing and stat; skip it.
-      }
-    }
-  }
-  transcripts.sort((a, b) => b.modifiedMs - a.modifiedMs);
-
-  for (const transcript of transcripts) {
-    const model = await lastJsonLineValue(transcript.file, '"model":', (record) => {
-      const value = (record as { message?: { model?: unknown } }).message?.model;
-      return typeof value === "string" && value !== "<synthetic>" ? value : undefined;
-    });
-    if (model) return model;
-  }
-
-  return undefined;
+  const projectDirectories = candidates.map((candidate) =>
+    join(configDirectory, "projects", claudeProjectSlug(candidate)));
+  const transcripts = await collectTranscriptFiles(projectDirectories);
+  return modelFromClaudeTranscripts(transcripts);
 }
 
 /** Resolve the exact model ID from an override, runtime environment, or active agent session. */
@@ -524,6 +578,43 @@ async function subjectLogFile(
   }
 }
 
+async function appendMarkdownLog(file: string, text: string): Promise<void> {
+  await mkdir(dirname(file), { recursive: true });
+  try {
+    // "ax" creates the file atomically, so concurrent first writes race on
+    // creation instead of both prepending the header.
+    const handle = await open(file, "ax");
+    try {
+      await handle.writeFile(HEADER + text, "utf8");
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const prefix = (await stat(file)).size === 0 ? HEADER : "";
+    await appendFile(file, prefix + text, "utf8");
+  }
+}
+
+export interface MirrorWrite {
+  file: string;
+  write: () => Promise<void>;
+}
+
+/** Run one write per resolved destination. Subject wins a deliberate collision
+ * with the global path because callers list it first. Independent mirrors start
+ * together only after the primary log has succeeded. */
+export async function writeUniqueMirrors(mirrors: MirrorWrite[]): Promise<void> {
+  const seen = new Set<string>();
+  const unique = mirrors.filter((mirror) => {
+    const destination = resolve(mirror.file);
+    if (seen.has(destination)) return false;
+    seen.add(destination);
+    return true;
+  });
+  await Promise.all(unique.map((mirror) => mirror.write()));
+}
+
 export async function recordPapercut(options: {
   message: string;
   directory?: string;
@@ -556,35 +647,30 @@ export async function recordPapercut(options: {
     file,
   };
 
-  await mkdir(dirname(file), { recursive: true });
   const text = formatEntry(entry);
-  try {
-    // "ax" creates the file atomically, so concurrent first writes race on
-    // creation instead of both prepending the header.
-    const handle = await open(file, "ax");
-    try {
-      await handle.writeFile(HEADER + text, "utf8");
-    } finally {
-      await handle.close();
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    const prefix = (await stat(file)).size === 0 ? HEADER : "";
-    await appendFile(file, prefix + text, "utf8");
-  }
+  await appendMarkdownLog(file, text);
 
+  const primary = resolve(file);
+  const mirrors: MirrorWrite[] = [];
   const subjectFile = await subjectLogFile(entry.about, environment);
-  if (subjectFile && resolve(subjectFile) !== resolve(file)) {
-    await mkdir(dirname(subjectFile), { recursive: true });
-    const exists = existsSync(subjectFile) && (await stat(subjectFile)).size > 0;
-    await appendFile(subjectFile, (exists ? "" : HEADER) + text, "utf8");
+  if (subjectFile && resolve(subjectFile) !== primary) {
+    mirrors.push({
+      file: subjectFile,
+      write: () => appendMarkdownLog(subjectFile, text),
+    });
   }
 
   const globalFile = resolveGlobalFile(environment);
-  if (globalFile && resolve(globalFile) !== resolve(file)) {
-    await mkdir(dirname(globalFile), { recursive: true });
-    await appendFile(globalFile, `${JSON.stringify(entry)}\n`, "utf8");
+  if (globalFile && resolve(globalFile) !== primary) {
+    mirrors.push({
+      file: globalFile,
+      write: async () => {
+        await mkdir(dirname(globalFile), { recursive: true });
+        await appendFile(globalFile, `${JSON.stringify(entry)}\n`, "utf8");
+      },
+    });
   }
+  await writeUniqueMirrors(mirrors);
 
   return entry;
 }

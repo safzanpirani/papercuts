@@ -1,15 +1,17 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { tmpdir } from "node:os";
 import {
   bumpPapercut,
   canonicalTag,
+  collectTranscriptFiles,
   detectAgent,
   detectModelId,
   entryId,
   findProjectRoot,
   findSimilar,
+  modelFromClaudeTranscripts,
   normalizeTags,
   readGlobalEntries,
   recordPapercut,
@@ -17,6 +19,7 @@ import {
   resolveLogFile,
   resolvePapercut,
   suggestTag,
+  writeUniqueMirrors,
 } from "./core.ts";
 
 const temporaryDirectories: string[] = [];
@@ -121,6 +124,84 @@ describe("global mirror", () => {
     expect(resolveGlobalFile({ HOME: home })).toBe(join(home, ".papercuts", "global.jsonl"));
     expect(resolveGlobalFile({ PAPERCUTS_GLOBAL_FILE: "off" })).toBeUndefined();
     expect(await readGlobalEntries({ HOME: home })).toEqual([]);
+  });
+});
+
+describe("mirror writes", () => {
+  test("deduplicates destinations and runs independent mirrors concurrently", async () => {
+    const finished: string[] = [];
+    let active = 0;
+    let peak = 0;
+    let duplicateRan = false;
+    const mirror = (file: string, delay: number) => ({
+      file,
+      write: async () => {
+        active++;
+        peak = Math.max(peak, active);
+        await Bun.sleep(delay);
+        finished.push(file);
+        active--;
+      },
+    });
+
+    await writeUniqueMirrors([
+      mirror("/tmp/subject", 8),
+      mirror("/tmp/global", 2),
+      { file: "/tmp/subject", write: async () => { duplicateRan = true; } },
+    ]);
+
+    expect(peak).toBe(2);
+    expect(finished).toEqual(["/tmp/global", "/tmp/subject"]);
+    expect(duplicateRan).toBe(false);
+  });
+
+  test("writes the primary first and does not touch mirrors when it fails", async () => {
+    const root = await temporaryDirectory();
+    await mkdir(join(root, ".git"));
+    const blocked = join(root, "blocked");
+    await mkdir(blocked);
+    const home = await temporaryDirectory();
+    const subject = await temporaryDirectory();
+    const globalFile = join(await temporaryDirectory(), "global.jsonl");
+    await mkdir(join(home, ".papercuts"), { recursive: true });
+    await writeFile(join(home, ".papercuts", "subjects.json"), JSON.stringify({ fleet: subject }));
+
+    await expect(recordPapercut({
+      directory: root,
+      file: blocked,
+      agent: "a",
+      modelId: "m",
+      about: "fleet",
+      message: "Primary write must fail.",
+      environment: { HOME: home, PAPERCUTS_GLOBAL_FILE: globalFile },
+    })).rejects.toThrow();
+
+    expect(await Bun.file(join(subject, "PAPERCUTS.md")).exists()).toBe(false);
+    expect(await Bun.file(globalFile).exists()).toBe(false);
+  });
+
+  test("deduplicates a subject/global path and keeps one Markdown mirror", async () => {
+    const root = await temporaryDirectory();
+    await mkdir(join(root, ".git"));
+    const home = await temporaryDirectory();
+    const subject = await temporaryDirectory();
+    const sharedMirror = join(subject, "PAPERCUTS.md");
+    await mkdir(join(home, ".papercuts"), { recursive: true });
+    await writeFile(join(home, ".papercuts", "subjects.json"), JSON.stringify({ fleet: subject }));
+
+    await recordPapercut({
+      directory: root,
+      agent: "a",
+      modelId: "m",
+      about: "fleet",
+      message: "One mirror destination should receive one entry.",
+      environment: { HOME: home, PAPERCUTS_GLOBAL_FILE: sharedMirror },
+    });
+
+    const mirrored = await readFile(sharedMirror, "utf8");
+    expect(mirrored.split("# PAPERCUTS").length - 1).toBe(1);
+    expect(mirrored.split("One mirror destination should receive one entry.").length - 1).toBe(1);
+    expect(mirrored).not.toContain('"message":"One mirror destination');
   });
 });
 
@@ -266,6 +347,110 @@ describe("model attribution", () => {
     );
 
     expect(await detectModelId({ CODEX_HOME: codexHome, CODEX_THREAD_ID: threadId })).toBe("gpt-5.6-sol");
+  });
+
+  test("keeps the Codex session scan newest-first", async () => {
+    const codexHome = await temporaryDirectory();
+    const threadId = "019f4ae3-newest-thread";
+    for (const [day, model] of [["09", "older-model"], ["10", "newer-model"]] as const) {
+      const directory = join(codexHome, "sessions", "2026", "07", day);
+      await mkdir(directory, { recursive: true });
+      await writeFile(
+        join(directory, `rollout-2026-07-${day}T12-00-00-${threadId}.jsonl`),
+        JSON.stringify({ type: "turn_context", payload: { model } }),
+      );
+    }
+
+    expect(await detectModelId({ CODEX_HOME: codexHome, CODEX_THREAD_ID: threadId })).toBe("newer-model");
+  });
+
+  test("stats Claude transcripts with an eight-file cap and deterministic mtime order", async () => {
+    const directory = await temporaryDirectory();
+    for (let index = 0; index < 12; index++)
+      await writeFile(join(directory, `session-${String(index).padStart(2, "0")}.jsonl`), "{}\n");
+
+    let active = 0;
+    let peak = 0;
+    const completed: string[] = [];
+    const transcripts = await collectTranscriptFiles([directory], {
+      statFile: async (file) => {
+        const name = basename(file);
+        const index = Number(name.match(/\d+/)![0]);
+        active++;
+        peak = Math.max(peak, active);
+        try {
+          await Bun.sleep((index + 1) * 2);
+          completed.push(name);
+          if (index === 4) throw Object.assign(new Error("gone"), { code: "ENOENT" });
+          return { mtimeMs: Math.floor(index / 2) };
+        } finally {
+          active--;
+        }
+      },
+    });
+
+    expect(peak).toBe(8);
+    expect(completed).not.toEqual([...completed].sort().reverse());
+    expect(transcripts.map((transcript) => basename(transcript.file))).toEqual([
+      "session-10.jsonl", "session-11.jsonl",
+      "session-08.jsonl", "session-09.jsonl",
+      "session-06.jsonl", "session-07.jsonl",
+      "session-05.jsonl",
+      "session-02.jsonl", "session-03.jsonl",
+      "session-00.jsonl", "session-01.jsonl",
+    ]);
+  });
+
+  test("returns the same ordered pool results with one worker and the default limit", async () => {
+    const directory = await temporaryDirectory();
+    for (let index = 0; index < 6; index++)
+      await writeFile(join(directory, `session-${index}.jsonl`), "{}\n");
+    const statFile = async (file: string) => {
+      const index = Number(basename(file).match(/\d+/)![0]);
+      await Bun.sleep((index + 1) * 2);
+      return { mtimeMs: Math.floor(index / 2) };
+    };
+
+    const serial = await collectTranscriptFiles([directory], { maxParallel: 1, statFile });
+    const pooled = await collectTranscriptFiles([directory], { statFile });
+
+    expect(pooled).toEqual(serial);
+    expect(pooled.map((transcript) => basename(transcript.file))).toEqual([
+      "session-4.jsonl", "session-5.jsonl",
+      "session-2.jsonl", "session-3.jsonl",
+      "session-0.jsonl", "session-1.jsonl",
+    ]);
+  });
+
+  test("rejects transcript pool limits that are not integers of at least one", async () => {
+    for (const maxParallel of [0, -1, 1.5, Number.NaN]) {
+      await expect(collectTranscriptFiles([], { maxParallel })).rejects.toThrow(
+        "maxParallel must be an integer ≥ 1",
+      );
+    }
+  });
+
+  test("continues when a Claude transcript disappears after stat and before read", async () => {
+    const directory = await temporaryDirectory();
+    const disappeared = join(directory, "newest.jsonl");
+    const fallback = join(directory, "older.jsonl");
+    await writeFile(disappeared, JSON.stringify({ message: { model: "gone-model" } }));
+    await writeFile(fallback, JSON.stringify({ message: { model: "fallback-model" } }));
+
+    const transcripts = await collectTranscriptFiles([directory], {
+      statFile: async (file) => ({ mtimeMs: file === disappeared ? 2 : 1 }),
+    });
+    await rm(disappeared);
+
+    expect(await modelFromClaudeTranscripts(transcripts)).toBe("fallback-model");
+  });
+
+  test("does not hide non-ENOENT transcript read errors", async () => {
+    const directory = await temporaryDirectory();
+
+    await expect(modelFromClaudeTranscripts([{ file: directory, modifiedMs: 1 }])).rejects.toMatchObject({
+      code: "EISDIR",
+    });
   });
 
   test("reads the exact model from the newest Claude Code transcript", async () => {
