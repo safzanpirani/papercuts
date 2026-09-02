@@ -225,7 +225,9 @@ describe("lifecycle", () => {
     const root = await temporaryDirectory();
     await mkdir(join(root, ".git"));
     const globalFile = join(await temporaryDirectory(), "global.jsonl");
-    return { root, environment: { PAPERCUTS_GLOBAL_FILE: globalFile } };
+    // HOME is isolated so the real ~/.papercuts/subjects.json never routes
+    // fixture entries into a maintainer's repository.
+    return { root, environment: { HOME: root, PAPERCUTS_GLOBAL_FILE: globalFile } };
   }
 
   test("assigns a stable ID and open status, and resolves with a note", async () => {
