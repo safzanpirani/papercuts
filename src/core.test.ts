@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, basename } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  annotateMarkdownEntry,
   bumpPapercut,
   canonicalTag,
   collectTranscriptFiles,
@@ -275,6 +276,44 @@ describe("lifecycle", () => {
     expect(bumped.lastSeen).toBeString();
     expect(await readFile(entry.file, "utf8")).toContain("**Hit again:**");
     expect(await readGlobalEntries(environment)).toHaveLength(1);
+  });
+
+  test("resolving one entry does not annotate another with the same timestamp", async () => {
+    const { root, environment } = await project();
+    const options = { directory: root, agent: "a", modelId: "m", environment, now: new Date("2026-09-12T00:00:00Z") };
+    const first = await recordPapercut({ ...options, message: "First separate problem." });
+    const second = await recordPapercut({ ...options, message: "Second separate problem." });
+    await resolvePapercut(second.id, { environment, note: "Fixed second problem." });
+    const markdown = await readFile(first.file, "utf8");
+    const [firstSection, secondSection] = markdown.slice(markdown.indexOf(`## ${first.id}`)).split(`## ${second.id}`);
+    expect(firstSection).not.toContain("**Resolved:**");
+    expect(secondSection).toContain("**Resolved:**");
+    expect(secondSection).toContain("Fixed second problem.");
+  });
+
+  test("legacy annotation matches only the heading timestamp", async () => {
+    const { root, environment } = await project();
+    const entry = await recordPapercut({ directory: root, agent: "a", modelId: "m", message: "Legacy problem.", environment });
+    await writeFile(entry.file, `## abcdef · 2000-01-01T00:00:00Z — ${entry.timestamp}\n\n- **Directory:** test\n\nUnrelated.\n\n## ${entry.timestamp} — a — m\n\n- **Directory:** test\n\nLegacy problem.\n`);
+    expect(await annotateMarkdownEntry(entry.file, entry, ["- **Resolved:** fixed"])).toBe(true);
+    const [unrelated, legacy] = (await readFile(entry.file, "utf8")).split(`## ${entry.timestamp} —`);
+    expect(unrelated).not.toContain("**Resolved:**");
+    expect(legacy).toContain("**Resolved:**");
+  });
+
+  test("bumping a resolved entry removes its old resolution from the current state", async () => {
+    const { root, environment } = await project();
+    const entry = await recordPapercut({ directory: root, agent: "a", modelId: "m", message: "A recurring problem.", environment });
+    await resolvePapercut(entry.id, { environment, note: "Previously fixed." });
+    const bumped = await bumpPapercut(entry.id, { environment });
+    expect(bumped.status).toBe("open");
+    expect(bumped.resolution).toBeUndefined();
+    expect(bumped.resolvedAt).toBeUndefined();
+    const [stored] = await readGlobalEntries(environment);
+    expect(stored?.resolution).toBeUndefined();
+    expect(stored?.resolvedAt).toBeUndefined();
+    expect(await readFile(entry.file, "utf8")).toContain("Previously fixed.");
+    expect(await readFile(entry.file, "utf8")).toContain("**Hit again:**");
   });
 
   test("finds a similar open entry for a near-duplicate message", async () => {

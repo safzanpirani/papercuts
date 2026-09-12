@@ -460,9 +460,10 @@ export async function annotateMarkdownEntry(
   }
 
   const lines = content.split("\n");
-  const headingIndex = lines.findIndex(
-    (line) => line.startsWith("## ") && (line.includes(`## ${entry.id} `) || line.includes(entry.timestamp)),
-  );
+  let headingIndex = lines.findIndex((line) => line.startsWith(`## ${entry.id} `));
+  if (headingIndex === -1) {
+    headingIndex = lines.findIndex((line) => line.startsWith(`## ${entry.timestamp} — `));
+  }
   if (headingIndex === -1) return false;
 
   // Bullets sit in one contiguous block after the heading; append to its end.
@@ -525,7 +526,7 @@ export async function bumpPapercut(
   return updateEntry(
     id,
     (entry) => ({
-      entry: { ...entry, occurrences: entry.occurrences + 1, lastSeen, status: "open" },
+      entry: { ...entry, occurrences: entry.occurrences + 1, lastSeen, status: "open", resolvedAt: undefined, resolution: undefined },
       bullets: [`- **Hit again:** ${lastSeen} (${entry.occurrences + 1} total)`],
     }),
     options.environment,

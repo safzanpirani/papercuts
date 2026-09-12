@@ -115,6 +115,8 @@ instead of appending a near-duplicate. `add` compares each new message against
 open entries and points at a likely match. Entries written before IDs and
 statuses existed get both derived on read, so old logs keep working unchanged.
 
+Lifecycle annotations match an entry's ID first; timestamp matching applies only to legacy headings without IDs. Bumping a resolved entry reopens it and clears its current resolution fields. The Markdown log retains the resolution and repeat history.
+
 Use `--file` or `PAPERCUTS_FILE` to override the per-project destination. Use
 `PAPERCUTS_GLOBAL_FILE` to relocate the cross-project mirror, or set it to
 `off` to disable mirroring. Papercuts always completes the primary Markdown append
