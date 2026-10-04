@@ -1,6 +1,6 @@
-import { appendFile, mkdir, open, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readdir, readFile, realpath, rename, rmdir, stat, unlink } from "node:fs/promises";
 import { existsSync, createReadStream } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { homedir } from "node:os";
 import { dirname, join, parse, resolve } from "node:path";
@@ -386,17 +386,123 @@ export async function readGlobalEntries(
   return entries;
 }
 
-/** Rewrite the global mirror in place (read-modify-write via a temp file + rename). */
+/** Remove only the unique marker of a dead owner. Competing reclaimers cannot
+ * remove a successor's marker. An empty directory can be replaced atomically. */
+async function recoverFileLock(lock: string): Promise<void> {
+  let owners: string[];
+  try {
+    owners = await readdir(lock);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  for (const owner of owners) {
+    const match = /^owner-([1-9]\d*)-[0-9a-f-]{36}$/.exec(owner);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (!Number.isSafeInteger(pid)) continue;
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      // EPERM and unknown errors do not prove that the owner has exited.
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") continue;
+      await rmdir(join(lock, owner)).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+      });
+    }
+  }
+}
+
+/** Cooperating processes acquire the global lock before any Markdown locks.
+ * Publish a nonempty directory so death during initialization cannot leave a
+ * lock without its PID. Never expire a live owner merely because it is slow. */
+async function withFileLock<T>(file: string, run: () => Promise<T>): Promise<T> {
+  // TODO(astra): Define support for stores that swap global and Markdown paths; global-first ordering can time out.
+  const lock = `${resolve(file)}.lock`;
+  await mkdir(dirname(lock), { recursive: true });
+  const token = randomUUID();
+  const owner = `owner-${process.pid}-${token}`;
+  let ownedDirectory = `${lock}.tmp-${token}`;
+  await mkdir(ownedDirectory);
+  try {
+    await mkdir(join(ownedDirectory, owner));
+    const deadline = performance.now() + 10_000;
+    while (true) {
+      try {
+        // rename replaces empty abandoned directories, but never a nonempty lock.
+        await rename(ownedDirectory, lock);
+        ownedDirectory = lock;
+        break;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "EEXIST" && code !== "ENOTEMPTY") throw error;
+        if (performance.now() >= deadline) throw new Error(`timed out waiting for papercuts lock: ${lock}`);
+        await recoverFileLock(lock);
+        await Bun.sleep(10 + Math.random() * 20);
+      }
+    }
+    return await run();
+  } finally {
+    await rmdir(join(ownedDirectory, owner)).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+    await rmdir(ownedDirectory).catch((error: NodeJS.ErrnoException) => {
+      // A contender may already have replaced our now-empty directory.
+      if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY" && error.code !== "EEXIST") throw error;
+    });
+  }
+}
+
+async function withMarkdownLocks<T>(files: string[], run: () => Promise<T>): Promise<T> {
+  const unique = [...new Set(files.map((file) => resolve(file)))].sort();
+  const acquire = (index: number): Promise<T> => index === unique.length
+    ? run()
+    : withFileLock(unique[index]!, () => acquire(index + 1));
+  return acquire(0);
+}
+
+async function atomicWrite(file: string, content: string): Promise<void> {
+  // Replacements must preserve the target and permissions of existing logs.
+  let mode = 0o666;
+  try {
+    file = await realpath(file);
+    mode = (await stat(file)).mode & 0o777;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const temporary = `${file}.tmp-${randomUUID()}`;
+  await mkdir(dirname(file), { recursive: true });
+  let owned = false;
+  let published = false;
+  try {
+    const handle = await open(temporary, "wx", mode);
+    owned = true;
+    try {
+      await handle.writeFile(content, "utf8");
+    } finally {
+      await handle.close();
+    }
+    await rename(temporary, file);
+    published = true;
+  } finally {
+    if (owned && !published) await unlink(temporary).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+  }
+}
+
+function globalContent(entries: Papercut[]): string {
+  return entries.map((entry) => `${JSON.stringify(entry)}\n`).join("");
+}
+
+/** Replace the entire mirror. Lifecycle callers lock before reading as well. */
 export async function writeGlobalEntries(
   entries: Papercut[],
   environment: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
   const globalFile = resolveGlobalFile(environment);
   if (!globalFile) throw new Error("global mirror is disabled; nothing to update");
-  const temporary = `${globalFile}.tmp-${process.pid}`;
-  await mkdir(dirname(globalFile), { recursive: true });
-  await writeFile(temporary, entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""), "utf8");
-  await rename(temporary, globalFile);
+  await withFileLock(globalFile, () => atomicWrite(globalFile, globalContent(entries)));
 }
 
 const STOPWORDS = new Set(
@@ -452,31 +558,43 @@ export async function annotateMarkdownEntry(
   entry: Papercut,
   bullets: string[],
 ): Promise<boolean> {
-  let content: string;
-  try {
-    content = await readFile(file, "utf8");
-  } catch {
-    return false;
-  }
+  return withFileLock(file, async () => {
+    const content = await readMarkdown(file);
+    if (content === undefined) return false;
+    const updated = annotatedMarkdown(content, entry, bullets);
+    if (updated === undefined) return false;
+    await atomicWrite(file, updated);
+    return true;
+  });
+}
 
+async function readMarkdown(file: string): Promise<string | undefined> {
+  try {
+    return await readFile(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function annotatedMarkdown(content: string, entry: Papercut, bullets: string[]): string | undefined {
   const lines = content.split("\n");
   let headingIndex = lines.findIndex((line) => line.startsWith(`## ${entry.id} `));
   if (headingIndex === -1) {
     headingIndex = lines.findIndex((line) => line.startsWith(`## ${entry.timestamp} — `));
   }
-  if (headingIndex === -1) return false;
+  if (headingIndex === -1) return undefined;
 
   // Bullets sit in one contiguous block after the heading; append to its end.
   let insertAt = headingIndex + 1;
   while (insertAt < lines.length && !lines[insertAt]!.startsWith("- **")) {
-    if (lines[insertAt]!.startsWith("## ")) return false;
+    if (lines[insertAt]!.startsWith("## ")) return undefined;
     insertAt++;
   }
   while (insertAt < lines.length && lines[insertAt]!.startsWith("- **")) insertAt++;
 
   lines.splice(insertAt, 0, ...bullets);
-  await writeFile(file, lines.join("\n"), "utf8");
-  return true;
+  return lines.join("\n");
 }
 
 async function updateEntry(
@@ -484,19 +602,51 @@ async function updateEntry(
   apply: (entry: Papercut) => { entry: Papercut; bullets: string[] },
   environment: NodeJS.ProcessEnv = process.env,
 ): Promise<Papercut> {
-  const entries = await readGlobalEntries(environment);
-  const matches = entries.filter((entry) => entry.id === id || entry.id.startsWith(id));
-  if (!matches.length) throw new Error(`no papercut with ID ${id}`);
-  if (matches.length > 1) throw new Error(`ID ${id} is ambiguous (${matches.map((e) => e.id).join(", ")})`);
+  const globalFile = resolveGlobalFile(environment);
+  if (!globalFile) throw new Error("global mirror is disabled; nothing to update");
+  return withFileLock(globalFile, async () => {
+    const entries = await readGlobalEntries(environment);
+    const matches = entries.filter((entry) => entry.id === id || entry.id.startsWith(id));
+    if (!matches.length) throw new Error(`no papercut with ID ${id}`);
+    if (matches.length > 1) throw new Error(`ID ${id} is ambiguous (${matches.map((e) => e.id).join(", ")})`);
 
-  const target = matches[0]!;
-  const { entry, bullets } = apply(target);
-  await writeGlobalEntries(
-    entries.map((existing) => (existing.id === target.id ? entry : existing)),
-    environment,
-  );
-  if (bullets.length) await annotateMarkdownEntry(entry.file, entry, bullets);
-  return entry;
+    const target = matches[0]!;
+    const { entry, bullets } = apply(target);
+    const subjectFile = await subjectLogFile(entry.about, environment);
+    const files = [...new Set([entry.file, ...(subjectFile ? [subjectFile] : [])].map((file) => resolve(file)))];
+    if (files.includes(resolve(globalFile))) throw new Error("global mirror cannot also be a Markdown log");
+    return withMarkdownLocks(files, async () => {
+      const changes: { file: string; before: string; after: string }[] = [];
+      for (const file of files) {
+        const before = await readMarkdown(file);
+        if (before === undefined) continue;
+        const after = annotatedMarkdown(before, entry, bullets);
+        if (after !== undefined) changes.push({ file, before, after });
+      }
+      // Publish JSON last. Restore published Markdown if a later write fails.
+      // Each rename is atomic; this is not a crash-atomic multi-file transaction.
+      const published: typeof changes = [];
+      try {
+        for (const change of changes) {
+          await atomicWrite(change.file, change.after);
+          published.push(change);
+        }
+        await atomicWrite(globalFile, globalContent(entries.map((existing) => existing.id === target.id ? entry : existing)));
+      } catch (error) {
+        const failures: unknown[] = [error];
+        for (const change of published.reverse()) {
+          try {
+            await atomicWrite(change.file, change.before);
+          } catch (rollbackError) {
+            failures.push(rollbackError);
+          }
+        }
+        if (failures.length > 1) throw new AggregateError(failures, "papercut update and Markdown rollback failed");
+        throw error;
+      }
+      return entry;
+    });
+  });
 }
 
 export async function resolvePapercut(
@@ -580,6 +730,10 @@ async function subjectLogFile(
 }
 
 async function appendMarkdownLog(file: string, text: string): Promise<void> {
+  return withFileLock(file, () => appendMarkdownLogUnlocked(file, text));
+}
+
+async function appendMarkdownLogUnlocked(file: string, text: string): Promise<void> {
   await mkdir(dirname(file), { recursive: true });
   try {
     // "ax" creates the file atomically, so concurrent first writes race on
@@ -613,7 +767,10 @@ export async function writeUniqueMirrors(mirrors: MirrorWrite[]): Promise<void> 
     seen.add(destination);
     return true;
   });
-  await Promise.all(unique.map((mirror) => mirror.write()));
+  // Wait for every writer before releasing the enclosing store lock on failure.
+  const results = await Promise.allSettled(unique.map((mirror) => Promise.resolve().then(() => mirror.write())));
+  const failure = results.find((result) => result.status === "rejected");
+  if (failure?.status === "rejected") throw failure.reason;
 }
 
 export async function recordPapercut(options: {
@@ -649,29 +806,39 @@ export async function recordPapercut(options: {
   };
 
   const text = formatEntry(entry);
-  await appendMarkdownLog(file, text);
-
-  const primary = resolve(file);
-  const mirrors: MirrorWrite[] = [];
-  const subjectFile = await subjectLogFile(entry.about, environment);
-  if (subjectFile && resolve(subjectFile) !== primary) {
-    mirrors.push({
-      file: subjectFile,
-      write: () => appendMarkdownLog(subjectFile, text),
-    });
-  }
-
   const globalFile = resolveGlobalFile(environment);
-  if (globalFile && resolve(globalFile) !== primary) {
-    mirrors.push({
-      file: globalFile,
-      write: async () => {
-        await mkdir(dirname(globalFile), { recursive: true });
-        await appendFile(globalFile, `${JSON.stringify(entry)}\n`, "utf8");
-      },
-    });
+  const subjectFile = await subjectLogFile(entry.about, environment);
+  const write = async () => {
+    await appendMarkdownLog(file, text);
+
+    const primary = resolve(file);
+    const mirrors: MirrorWrite[] = [];
+    if (subjectFile && resolve(subjectFile) !== primary) {
+      mirrors.push({
+        file: subjectFile,
+        write: () => appendMarkdownLog(subjectFile, text),
+      });
+    }
+
+    if (globalFile && resolve(globalFile) !== primary) {
+      mirrors.push({
+        file: globalFile,
+        write: async () => {
+          await mkdir(dirname(globalFile), { recursive: true });
+          await appendFile(globalFile, `${JSON.stringify(entry)}\n`, "utf8");
+        },
+      });
+    }
+    await writeUniqueMirrors(mirrors);
+  };
+  // The store lock covers the primary append and all mirrors, so lifecycle
+  // rewrites cannot replace a snapshot taken before an append completed.
+  // A global/Markdown collision already uses the Markdown destination's lock.
+  if (globalFile && globalFile !== resolve(file) && globalFile !== (subjectFile && resolve(subjectFile))) {
+    await withFileLock(globalFile, write);
+  } else {
+    await write();
   }
-  await writeUniqueMirrors(mirrors);
 
   return entry;
 }

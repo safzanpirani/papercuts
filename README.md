@@ -125,6 +125,17 @@ concurrently. Duplicate resolved paths receive one write, which prevents a subje
 and global override from double-appending the same file. Lifecycle updates such as
 `resolve` and `bump` remain serial read-modify-write operations.
 
+Concurrent writers use process-shared locks. A lock records its process ID and
+a unique ownership token. Later writers recover locks after the owner exits.
+Waiters fail after ten seconds if the owner stays alive; they never evict a slow
+live writer. Locks require cooperating clients on the same host and consistent
+destination paths. Older clients do not participate in this protocol.
+
+Lifecycle updates publish Markdown before JSON and attempt rollback on ordinary
+write failures. A process kill can interrupt a multi-file update and leave
+unfinished temporary files. Lock recovery restores access but does not repair
+partially published history.
+
 The companion skill is intentionally small: it teaches an agent to record a
 papercut immediately, in one or two useful sentences, without interrupting the
 task or turning the log into an issue tracker.
