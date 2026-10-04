@@ -386,28 +386,70 @@ export async function readGlobalEntries(
   return entries;
 }
 
+/** Remove only the unique marker of a dead owner. Competing reclaimers cannot
+ * remove a successor's marker. An empty directory can be replaced atomically. */
+async function recoverFileLock(lock: string): Promise<void> {
+  let owners: string[];
+  try {
+    owners = await readdir(lock);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  for (const owner of owners) {
+    const match = /^owner-([1-9]\d*)-[0-9a-f-]{36}$/.exec(owner);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (!Number.isSafeInteger(pid)) continue;
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      // EPERM and unknown errors do not prove that the owner has exited.
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") continue;
+      await rmdir(join(lock, owner)).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+      });
+    }
+  }
+}
+
 /** Cooperating processes acquire the global lock before any Markdown locks.
- * Never steal an old lock: a slow writer may still own it. A killed process
- * leaves a lock directory that must be removed after confirming it has stopped. */
+ * Publish a nonempty directory so death during initialization cannot leave a
+ * lock without its PID. Never expire a live owner merely because it is slow. */
 async function withFileLock<T>(file: string, run: () => Promise<T>): Promise<T> {
   // TODO(astra): Define support for stores that swap global and Markdown paths; global-first ordering can time out.
   const lock = `${resolve(file)}.lock`;
   await mkdir(dirname(lock), { recursive: true });
-  const deadline = Date.now() + 10_000;
-  while (true) {
-    try {
-      await mkdir(lock);
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (Date.now() >= deadline) throw new Error(`timed out waiting for papercuts lock: ${lock}`);
-      await Bun.sleep(10 + Math.random() * 20);
-    }
-  }
+  const token = randomUUID();
+  const owner = `owner-${process.pid}-${token}`;
+  let ownedDirectory = `${lock}.tmp-${token}`;
+  await mkdir(ownedDirectory);
   try {
+    await mkdir(join(ownedDirectory, owner));
+    const deadline = performance.now() + 10_000;
+    while (true) {
+      try {
+        // rename replaces empty abandoned directories, but never a nonempty lock.
+        await rename(ownedDirectory, lock);
+        ownedDirectory = lock;
+        break;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "EEXIST" && code !== "ENOTEMPTY") throw error;
+        if (performance.now() >= deadline) throw new Error(`timed out waiting for papercuts lock: ${lock}`);
+        await recoverFileLock(lock);
+        await Bun.sleep(10 + Math.random() * 20);
+      }
+    }
     return await run();
   } finally {
-    await rmdir(lock);
+    await rmdir(join(ownedDirectory, owner)).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+    await rmdir(ownedDirectory).catch((error: NodeJS.ErrnoException) => {
+      // A contender may already have replaced our now-empty directory.
+      if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY" && error.code !== "EEXIST") throw error;
+    });
   }
 }
 

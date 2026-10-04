@@ -1,6 +1,7 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bumpPapercut, readGlobalEntries, recordPapercut, resolvePapercut, writeGlobalEntries, writeUniqueMirrors } from "../src/core.ts";
@@ -27,6 +28,121 @@ async function expectClean(root: string) {
   const files = await readdir(root, { recursive: true });
   expect(files.filter((file) => file.includes(".tmp-") || file.endsWith(".lock"))).toEqual([]);
 }
+
+for (const held of ["global", "markdown"]) {
+  test(`recovers locks after killing a writer holding the ${held} lock`, async () => {
+    const { root, environment, entry } = await store("tool");
+    const worker = `
+      import { spyOn } from 'bun:test';
+      import * as fs from 'node:fs/promises';
+      import { bumpPapercut } from ${JSON.stringify(new URL("../src/core.ts", import.meta.url).pathname)};
+      const [root, id, blocked] = process.argv.slice(1);
+      const read = fs.readFile;
+      spyOn(fs, 'readFile').mockImplementation(async (...args) => {
+        if (args[0] === blocked) {
+          console.log('locked');
+          await Bun.stdin.text();
+        }
+        return read(...args);
+      });
+      await bumpPapercut(id, { environment: { HOME: root, PAPERCUTS_GLOBAL_FILE: root + '/global.jsonl' } });
+    `;
+    const child = Bun.spawn({
+      cmd: [process.execPath, "--no-env-file", "-e", worker, root, entry.id,
+        held === "global" ? environment.PAPERCUTS_GLOBAL_FILE : entry.file],
+      stdin: "pipe", stdout: "pipe", stderr: "pipe",
+    });
+    try {
+      const reader = child.stdout.getReader();
+      try {
+        expect(new TextDecoder().decode((await reader.read()).value)).toContain("locked");
+      } finally {
+        reader.releaseLock();
+      }
+    } finally {
+      child.kill("SIGKILL");
+      await child.exited;
+    }
+    // Both contenders can observe the same abandoned lock before either recovers it.
+    const results = await Promise.allSettled([
+      bumpPapercut(entry.id, { environment }),
+      bumpPapercut(entry.id, { environment }),
+    ]);
+    expect(results.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+    expect((await readGlobalEntries(environment))[0]!.occurrences).toBe(3);
+    for (const file of [entry.file, join(root, "subject", "PAPERCUTS.md")]) {
+      expect((await readFile(file, "utf8")).match(/\*\*Hit again:\*\*/g)).toHaveLength(2);
+    }
+    await expectClean(root);
+  }, 20000);
+}
+
+test("recovers an empty lock left by an interrupted release", async () => {
+  const { root, environment, entry } = await store();
+  await mkdir(`${environment.PAPERCUTS_GLOBAL_FILE}.lock`);
+  expect((await bumpPapercut(entry.id, { environment })).occurrences).toBe(2);
+  await expectClean(root);
+});
+
+test("times out without stealing an old lock from a live process", async () => {
+  const { root, environment, entry } = await store();
+  const lock = `${environment.PAPERCUTS_GLOBAL_FILE}.lock`;
+  const owner = `owner-${process.pid}-${randomUUID()}`;
+  await mkdir(join(lock, owner), { recursive: true });
+  const old = new Date("2000-01-01T00:00:00Z");
+  await utimes(lock, old, old);
+  const started = performance.now();
+  await expect(bumpPapercut(entry.id, { environment })).rejects.toThrow("timed out waiting for papercuts lock");
+  expect(performance.now() - started).toBeLessThan(15000);
+  expect(await readdir(lock)).toEqual([owner]);
+  expect((await readGlobalEntries(environment))[0]!.occurrences).toBe(1);
+  await rm(lock, { recursive: true });
+  expect((await bumpPapercut(entry.id, { environment })).occurrences).toBe(2);
+  await expectClean(root);
+}, 20000);
+
+test("a delayed stale-lock reclaimer cannot remove a successor's ownership", async () => {
+  const { root, environment, entry } = await store();
+  const child = Bun.spawn({ cmd: [process.execPath, "-e", ""], stdout: "ignore", stderr: "ignore" });
+  expect(await child.exited).toBe(0);
+  const lock = `${environment.PAPERCUTS_GLOBAL_FILE}.lock`;
+  const marker = join(lock, `owner-${child.pid}-${randomUUID()}`);
+  await mkdir(marker, { recursive: true });
+  const bothReclaimers = Promise.withResolvers<void>();
+  const successor = Promise.withResolvers<void>();
+  const rmdir = fs.rmdir;
+  const rename = fs.rename;
+  let removals = 0;
+  const remove = spyOn(fs, "rmdir").mockImplementation(async (...args: Parameters<typeof fs.rmdir>) => {
+    if (args[0] === marker) {
+      removals++;
+      if (removals === 1) await bothReclaimers.promise;
+      else {
+        bothReclaimers.resolve();
+        await successor.promise;
+      }
+    }
+    return rmdir(...args);
+  });
+  const publish = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+    await rename(from, to);
+    if (to === lock) successor.resolve();
+  });
+  try {
+    const results = await Promise.allSettled([
+      bumpPapercut(entry.id, { environment }),
+      bumpPapercut(entry.id, { environment }),
+    ]);
+    expect(results.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+    expect(removals).toBe(2);
+  } finally {
+    remove.mockRestore();
+    publish.mockRestore();
+  }
+  expect((await readGlobalEntries(environment))[0]!.occurrences).toBe(3);
+  expect((await readFile(entry.file, "utf8")).match(/\*\*Hit again:\*\*/g)).toHaveLength(2);
+  await expectClean(root);
+});
 
 test("preserves two simultaneous bumps in one process", async () => {
   const { root, environment, entry } = await store();
