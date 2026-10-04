@@ -1,4 +1,4 @@
-import { appendFile, mkdir, open, readdir, readFile, rename, rmdir, stat, unlink } from "node:fs/promises";
+import { appendFile, mkdir, open, readdir, readFile, realpath, rename, rmdir, stat, unlink } from "node:fs/promises";
 import { existsSync, createReadStream } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
@@ -462,12 +462,20 @@ async function withMarkdownLocks<T>(files: string[], run: () => Promise<T>): Pro
 }
 
 async function atomicWrite(file: string, content: string): Promise<void> {
+  // Replacements must preserve the target and permissions of existing logs.
+  let mode = 0o666;
+  try {
+    file = await realpath(file);
+    mode = (await stat(file)).mode & 0o777;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
   const temporary = `${file}.tmp-${randomUUID()}`;
   await mkdir(dirname(file), { recursive: true });
   let owned = false;
   let published = false;
   try {
-    const handle = await open(temporary, "wx");
+    const handle = await open(temporary, "wx", mode);
     owned = true;
     try {
       await handle.writeFile(content, "utf8");

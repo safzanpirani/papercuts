@@ -1,6 +1,6 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
-import { mkdtemp, mkdir, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -229,6 +229,27 @@ test("cleans temporary files after a failed replacement and allows a retry", asy
   await rm(environment.PAPERCUTS_GLOBAL_FILE, { recursive: true });
   await writeGlobalEntries([entry], environment);
   expect(await readGlobalEntries(environment)).toEqual([entry]);
+  await expectClean(root);
+});
+
+test("preserves private log permissions during lifecycle replacements", async () => {
+  const { root, environment, entry } = await store("tool");
+  const files = [entry.file, join(root, "subject", "PAPERCUTS.md"), environment.PAPERCUTS_GLOBAL_FILE];
+  for (const file of files) await chmod(file, 0o600);
+  await bumpPapercut(entry.id, { environment });
+  for (const file of files) expect((await stat(file)).mode & 0o777).toBe(0o600);
+  await expectClean(root);
+});
+
+test("updates a symlinked Markdown target without replacing the link", async () => {
+  const { root, environment, entry } = await store();
+  const target = join(root, "history.md");
+  await fs.rename(entry.file, target);
+  await symlink("history.md", entry.file);
+  await bumpPapercut(entry.id, { environment });
+  expect((await lstat(entry.file)).isSymbolicLink()).toBe(true);
+  expect(await readFile(target, "utf8")).toContain("(2 total)");
+  expect((await readGlobalEntries(environment))[0]!.occurrences).toBe(2);
   await expectClean(root);
 });
 
