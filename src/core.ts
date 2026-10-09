@@ -444,9 +444,31 @@ export function findSimilar(
 }
 
 /**
- * Add metadata bullets to an entry already written to a Markdown log. Matches on
- * the ID when present and falls back to the timestamp for pre-ID entries.
+ * Locate an entry's section in a Markdown log. Matches on the ID when present and
+ * falls back to the timestamp for pre-ID entries. `bulletsEnd` is the index just
+ * past the contiguous metadata bullet block that follows the heading.
  */
+function findMarkdownEntry(
+  lines: string[],
+  entry: Pick<Papercut, "id" | "timestamp">,
+): { bulletsStart: number; bulletsEnd: number } | undefined {
+  let headingIndex = lines.findIndex((line) => line.startsWith(`## ${entry.id} `));
+  if (headingIndex === -1) {
+    headingIndex = lines.findIndex((line) => line.startsWith(`## ${entry.timestamp} — `));
+  }
+  if (headingIndex === -1) return undefined;
+
+  let bulletsStart = headingIndex + 1;
+  while (bulletsStart < lines.length && !lines[bulletsStart]!.startsWith("- **")) {
+    if (lines[bulletsStart]!.startsWith("## ")) return undefined;
+    bulletsStart++;
+  }
+  let bulletsEnd = bulletsStart;
+  while (bulletsEnd < lines.length && lines[bulletsEnd]!.startsWith("- **")) bulletsEnd++;
+  return { bulletsStart, bulletsEnd };
+}
+
+/** Add metadata bullets to an entry already written to a Markdown log. */
 export async function annotateMarkdownEntry(
   file: string,
   entry: Papercut,
@@ -460,30 +482,66 @@ export async function annotateMarkdownEntry(
   }
 
   const lines = content.split("\n");
-  let headingIndex = lines.findIndex((line) => line.startsWith(`## ${entry.id} `));
-  if (headingIndex === -1) {
-    headingIndex = lines.findIndex((line) => line.startsWith(`## ${entry.timestamp} — `));
-  }
-  if (headingIndex === -1) return false;
+  const block = findMarkdownEntry(lines, entry);
+  if (!block) return false;
 
-  // Bullets sit in one contiguous block after the heading; append to its end.
-  let insertAt = headingIndex + 1;
-  while (insertAt < lines.length && !lines[insertAt]!.startsWith("- **")) {
-    if (lines[insertAt]!.startsWith("## ")) return false;
-    insertAt++;
-  }
-  while (insertAt < lines.length && lines[insertAt]!.startsWith("- **")) insertAt++;
-
-  lines.splice(insertAt, 0, ...bullets);
+  lines.splice(block.bulletsEnd, 0, ...bullets);
   await writeFile(file, lines.join("\n"), "utf8");
   return true;
+}
+
+/**
+ * Status recorded in a Markdown copy: the last lifecycle bullet wins, because
+ * bump reopens a resolved entry by appending "Hit again" after "Resolved".
+ */
+export function markdownStatus(
+  content: string,
+  entry: Pick<Papercut, "id" | "timestamp">,
+): Papercut["status"] | undefined {
+  const lines = content.split("\n");
+  const block = findMarkdownEntry(lines, entry);
+  if (!block) return undefined;
+  let status: Papercut["status"] = "open";
+  for (const line of lines.slice(block.bulletsStart, block.bulletsEnd)) {
+    if (line.startsWith("- **Resolved:**")) status = "resolved";
+    else if (line.startsWith("- **Hit again:**")) status = "open";
+  }
+  return status;
+}
+
+/**
+ * Every Markdown log that should hold a copy of the entry: the file it was
+ * written to and the subject repo's log from ~/.papercuts/subjects.json.
+ */
+export async function markdownCopies(
+  entry: Papercut,
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<string[]> {
+  const subjectFile = await subjectLogFile(entry.about, environment);
+  return [...new Set([entry.file, subjectFile].filter((file): file is string => !!file).map((file) => resolve(file)))];
+}
+
+export interface LifecycleOptions {
+  now?: Date;
+  environment?: NodeJS.ProcessEnv;
+  /** Annotate only these Markdown logs instead of every known copy; [] updates only the global mirror. */
+  files?: string[];
+}
+
+export interface LifecycleResult {
+  entry: Papercut;
+  /** Markdown logs that received the annotation. */
+  annotated: string[];
+  /** Markdown logs that were missing or did not contain the entry. */
+  missed: string[];
 }
 
 async function updateEntry(
   id: string,
   apply: (entry: Papercut) => { entry: Papercut; bullets: string[] },
-  environment: NodeJS.ProcessEnv = process.env,
-): Promise<Papercut> {
+  options: LifecycleOptions,
+): Promise<LifecycleResult> {
+  const environment = options.environment ?? process.env;
   const entries = await readGlobalEntries(environment);
   const matches = entries.filter((entry) => entry.id === id || entry.id.startsWith(id));
   if (!matches.length) throw new Error(`no papercut with ID ${id}`);
@@ -495,14 +553,32 @@ async function updateEntry(
     entries.map((existing) => (existing.id === target.id ? entry : existing)),
     environment,
   );
-  if (bullets.length) await annotateMarkdownEntry(entry.file, entry, bullets);
-  return entry;
+
+  const files = options.files
+    ? [...new Set(options.files.map((file) => resolve(file)))]
+    : await markdownCopies(entry, environment);
+  const annotated: string[] = [];
+  const missed: string[] = [];
+  // Serial: two copies may be the same file under different spellings.
+  for (const file of files) {
+    if (bullets.length && (await annotateMarkdownEntry(file, entry, bullets))) annotated.push(file);
+    else missed.push(file);
+  }
+  return { entry, annotated, missed };
+}
+
+export function resolutionBullet(resolvedAt: string, note?: string): string {
+  return `- **Resolved:** ${resolvedAt}${note ? ` — ${oneLine(note)}` : ""}`;
+}
+
+export function hitAgainBullet(lastSeen: string, occurrences: number): string {
+  return `- **Hit again:** ${lastSeen} (${occurrences} total)`;
 }
 
 export async function resolvePapercut(
   id: string,
-  options: { note?: string; now?: Date; environment?: NodeJS.ProcessEnv } = {},
-): Promise<Papercut> {
+  options: LifecycleOptions & { note?: string } = {},
+): Promise<LifecycleResult> {
   const resolvedAt = (options.now ?? new Date()).toISOString();
   return updateEntry(
     id,
@@ -511,26 +587,103 @@ export async function resolvePapercut(
       const note = options.note?.trim();
       return {
         entry: { ...entry, status: "resolved", resolvedAt, resolution: note },
-        bullets: [`- **Resolved:** ${resolvedAt}${note ? ` — ${oneLine(note)}` : ""}`],
+        bullets: [resolutionBullet(resolvedAt, note)],
       };
     },
-    options.environment,
+    options,
   );
 }
 
 export async function bumpPapercut(
   id: string,
-  options: { now?: Date; environment?: NodeJS.ProcessEnv } = {},
-): Promise<Papercut> {
+  options: LifecycleOptions = {},
+): Promise<LifecycleResult> {
   const lastSeen = (options.now ?? new Date()).toISOString();
   return updateEntry(
     id,
     (entry) => ({
       entry: { ...entry, occurrences: entry.occurrences + 1, lastSeen, status: "open", resolvedAt: undefined, resolution: undefined },
-      bullets: [`- **Hit again:** ${lastSeen} (${entry.occurrences + 1} total)`],
+      bullets: [hitAgainBullet(lastSeen, entry.occurrences + 1)],
     }),
-    options.environment,
+    options,
   );
+}
+
+export interface CopyDrift {
+  file: string;
+  /** Absent when an explicitly named file is missing. */
+  entry?: Papercut;
+  kind: "missing-file" | "missing-entry" | "status";
+  /** Status the Markdown copy records, for "status" drift. */
+  markdownStatus?: Papercut["status"];
+  fixed?: boolean;
+}
+
+/**
+ * Compare the global mirror against Markdown copies. Without `files`, checks each
+ * entry's known copies; with `files`, checks every global entry those files hold,
+ * which covers copies the mirror does not know about. `fix` appends the missing
+ * lifecycle bullet to a copy whose status disagrees with the mirror.
+ */
+export async function checkMarkdownCopies(
+  entries: Papercut[],
+  options: { files?: string[]; fix?: boolean; environment?: NodeJS.ProcessEnv } = {},
+): Promise<CopyDrift[]> {
+  const environment = options.environment ?? process.env;
+  const contents = new Map<string, string | undefined>();
+  const read = async (file: string): Promise<string | undefined> => {
+    if (!contents.has(file)) contents.set(file, await readFile(file, "utf8").catch(() => undefined));
+    return contents.get(file);
+  };
+
+  const pairs: { file: string; entry: Papercut }[] = [];
+  const drift: CopyDrift[] = [];
+  if (options.files) {
+    for (const file of [...new Set(options.files.map((name) => resolve(name)))]) {
+      const content = await read(file);
+      if (content === undefined) {
+        drift.push({ file, kind: "missing-file" });
+        continue;
+      }
+      for (const entry of entries) {
+        if (markdownStatus(content, entry) !== undefined) pairs.push({ file, entry });
+      }
+    }
+  } else {
+    for (const entry of entries) {
+      for (const file of await markdownCopies(entry, environment)) pairs.push({ file, entry });
+    }
+  }
+
+  for (const { file, entry } of pairs) {
+    const content = await read(file);
+    if (content === undefined) {
+      drift.push({ file, entry, kind: "missing-file" });
+      continue;
+    }
+    const recorded = markdownStatus(content, entry);
+    if (recorded === undefined) {
+      drift.push({ file, entry, kind: "missing-entry" });
+      continue;
+    }
+    if (recorded === entry.status) continue;
+
+    const item: CopyDrift = { file, entry, kind: "status", markdownStatus: recorded };
+    if (options.fix) {
+      const bullet =
+        entry.status === "resolved" && entry.resolvedAt
+          ? resolutionBullet(entry.resolvedAt, entry.resolution)
+          : entry.status === "open" && entry.lastSeen
+            ? hitAgainBullet(entry.lastSeen, entry.occurrences)
+            : undefined;
+      if (bullet && (await annotateMarkdownEntry(file, entry, [bullet]))) {
+        item.fixed = true;
+        contents.delete(file);
+      }
+    }
+    drift.push(item);
+  }
+  return drift;
 }
 
 function oneLine(value: string): string {

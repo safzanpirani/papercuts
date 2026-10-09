@@ -23,7 +23,8 @@ Use this for missed or dead-end tool calls, broken links, confusing or undocumen
 
 - `papercuts list` shows this project's **open** papercuts (`--all` for every project, `--about <tool>` for one subject, `--resolved` for closed ones).
 - `papercuts top [tag|about|project|agent|model]` ranks recurring friction by entries and total hits — the fastest way to find what is worth fixing.
-- `papercuts resolve <id> --note "<what fixed it>"` closes one after the underlying friction is gone. Do this when you fix something a papercut described; otherwise the log only grows and open friction becomes indistinguishable from fixed friction.
+- `papercuts resolve <id> --note "<what fixed it>"` closes one after the underlying friction is gone. Do this when you fix something a papercut described; otherwise the log only grows and open friction becomes indistinguishable from fixed friction. It annotates every known Markdown copy; use `--file <path>` for a moved log or a worktree, and `--global-only` to leave Markdown untouched.
+- `papercuts check [--all | --file <path>] [--fix]` finds Markdown copies whose status drifted from the global mirror.
 
 Do not use `PAPERCUTS.md` as a substitute for a real bug report, tracked work, or the final account of what was accomplished. Never include secrets, tokens, private user data, or raw credentials.
 

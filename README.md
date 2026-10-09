@@ -80,6 +80,10 @@ papercuts top tag --all -n 10
 papercuts tags                 # canonical vocabulary + what's in use
 papercuts bump 29558a          # hit the same friction again
 papercuts resolve 29558a --note "Added a targeted error in cli.ts."
+papercuts resolve 29558a --file ../renamed/PAPERCUTS.md   # annotate a moved copy
+papercuts resolve 29558a --global-only                    # leave Markdown logs untouched
+papercuts check --all          # Markdown copies that drifted from the mirror
+papercuts check --file PAPERCUTS.md --fix
 papercuts path
 ```
 
@@ -109,13 +113,26 @@ that owns it in `~/.papercuts/subjects.json` and the entry is also filed there:
 ```
 
 Each entry carries a short ID and a status. `papercuts list` shows open ones by
-default; `papercuts resolve <id> --note "<fix>"` closes one and annotates both
-the Markdown log and the mirror, and `papercuts bump <id>` counts a repeat
+default; `papercuts resolve <id> --note "<fix>"` closes one in the mirror and
+annotates every known Markdown copy, and `papercuts bump <id>` counts a repeat
 instead of appending a near-duplicate. `add` compares each new message against
 open entries and points at a likely match. Entries written before IDs and
 statuses existed get both derived on read, so old logs keep working unchanged.
 
 Lifecycle annotations match an entry's ID first; timestamp matching applies only to legacy headings without IDs. Bumping a resolved entry reopens it and clears its current resolution fields. The Markdown log retains the resolution and repeat history.
+
+An entry's known copies are the log it was first written to and, when its subject
+appears in `subjects.json`, the subject repo's log. `resolve` and `bump` annotate
+each copy and name any copy that is missing or no longer holds the entry, such as a
+log whose directory was renamed. Pass `--file` (repeatable) to annotate only the
+named logs, for example the moved log or a log inside an isolated worktree. Pass
+`--global-only` to update the mirror without touching any Markdown log.
+
+`papercuts check` compares the mirror against each entry's known copies and
+reports missing files, missing entries, and status drift. `check --file <path>`
+instead checks every entry that a given log holds, which covers hand-copied logs the
+mirror does not know about. Add `--fix` to append the missing `Resolved` or
+`Hit again` bullet to each drifted copy.
 
 Use `--file` or `PAPERCUTS_FILE` to override the per-project destination. Use
 `PAPERCUTS_GLOBAL_FILE` to relocate the cross-project mirror, or set it to
