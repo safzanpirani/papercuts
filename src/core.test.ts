@@ -6,6 +6,7 @@ import {
   annotateMarkdownEntry,
   bumpPapercut,
   canonicalTag,
+  checkMarkdownCopies,
   collectTranscriptFiles,
   detectAgent,
   detectModelId,
@@ -252,8 +253,9 @@ describe("lifecycle", () => {
     expect(markdown).toContain(`## ${entry.id} · ${entry.timestamp}`);
     expect(markdown).toContain("**About:** `fleet`");
 
-    const resolved = await resolvePapercut(entry.id, { note: "Added a targeted error in cli.ts.", environment });
+    const { entry: resolved, annotated } = await resolvePapercut(entry.id, { note: "Added a targeted error in cli.ts.", environment });
     expect(resolved.status).toBe("resolved");
+    expect(annotated).toEqual([entry.file]);
     expect((await readGlobalEntries(environment))[0]!.status).toBe("resolved");
     expect(await readFile(entry.file, "utf8")).toContain("**Resolved:**");
     expect(await readFile(entry.file, "utf8")).toContain("Added a targeted error in cli.ts.");
@@ -271,7 +273,7 @@ describe("lifecycle", () => {
       environment,
     });
 
-    const bumped = await bumpPapercut(entry.id.slice(0, 4), { environment });
+    const { entry: bumped } = await bumpPapercut(entry.id.slice(0, 4), { environment });
     expect(bumped.occurrences).toBe(2);
     expect(bumped.lastSeen).toBeString();
     expect(await readFile(entry.file, "utf8")).toContain("**Hit again:**");
@@ -305,7 +307,7 @@ describe("lifecycle", () => {
     const { root, environment } = await project();
     const entry = await recordPapercut({ directory: root, agent: "a", modelId: "m", message: "A recurring problem.", environment });
     await resolvePapercut(entry.id, { environment, note: "Previously fixed." });
-    const bumped = await bumpPapercut(entry.id, { environment });
+    const { entry: bumped } = await bumpPapercut(entry.id, { environment });
     expect(bumped.status).toBe("open");
     expect(bumped.resolution).toBeUndefined();
     expect(bumped.resolvedAt).toBeUndefined();
@@ -314,6 +316,80 @@ describe("lifecycle", () => {
     expect(stored?.resolvedAt).toBeUndefined();
     expect(await readFile(entry.file, "utf8")).toContain("Previously fixed.");
     expect(await readFile(entry.file, "utf8")).toContain("**Hit again:**");
+  });
+
+  async function subjectProject(): Promise<{ root: string; subjectLog: string; environment: NodeJS.ProcessEnv }> {
+    const { root, environment } = await project();
+    const subject = await temporaryDirectory();
+    await mkdir(join(root, ".papercuts"));
+    await writeFile(join(root, ".papercuts", "subjects.json"), JSON.stringify({ fleet: subject }));
+    return { root, subjectLog: join(subject, "PAPERCUTS.md"), environment };
+  }
+
+  test("resolve and bump annotate the subject mirror as well as the original log", async () => {
+    const { root, subjectLog, environment } = await subjectProject();
+    const entry = await recordPapercut({ directory: root, agent: "a", modelId: "m", message: "Mirrored problem.", about: "fleet", environment });
+
+    const resolved = await resolvePapercut(entry.id, { environment, note: "Fixed upstream." });
+    expect(resolved.annotated).toEqual([entry.file, subjectLog]);
+    expect(resolved.missed).toEqual([]);
+    expect(await readFile(subjectLog, "utf8")).toContain("Fixed upstream.");
+
+    await bumpPapercut(entry.id, { environment });
+    expect(await readFile(subjectLog, "utf8")).toContain("**Hit again:**");
+  });
+
+  test("resolve honors --file for a log that moved after a rename", async () => {
+    const { root, environment } = await project();
+    const entry = await recordPapercut({ directory: root, agent: "a", modelId: "m", message: "Renamed problem.", environment });
+    const moved = join(await temporaryDirectory(), "PAPERCUTS.md");
+    await writeFile(moved, await readFile(entry.file, "utf8"));
+    await rm(entry.file);
+
+    const result = await resolvePapercut(entry.id, { environment, files: [moved] });
+    expect(result.annotated).toEqual([moved]);
+    expect(await readFile(moved, "utf8")).toContain("**Resolved:**");
+  });
+
+  test("reports a missing copy instead of claiming it was annotated", async () => {
+    const { root, environment } = await project();
+    const entry = await recordPapercut({ directory: root, agent: "a", modelId: "m", message: "Lost problem.", environment });
+    await rm(entry.file);
+
+    const result = await resolvePapercut(entry.id, { environment });
+    expect(result.annotated).toEqual([]);
+    expect(result.missed).toEqual([entry.file]);
+  });
+
+  test("a global-only resolve leaves every Markdown log untouched", async () => {
+    const { root, subjectLog, environment } = await subjectProject();
+    const entry = await recordPapercut({ directory: root, agent: "a", modelId: "m", message: "Protected problem.", about: "fleet", environment });
+    const before = [await readFile(entry.file, "utf8"), await readFile(subjectLog, "utf8")];
+
+    const result = await resolvePapercut(entry.id, { environment, files: [] });
+    expect(result.entry.status).toBe("resolved");
+    expect(result.annotated).toEqual([]);
+    expect([await readFile(entry.file, "utf8"), await readFile(subjectLog, "utf8")]).toEqual(before);
+  });
+
+  test("check reports copies that drifted from the mirror and fixes them", async () => {
+    const { root, subjectLog, environment } = await subjectProject();
+    const entry = await recordPapercut({ directory: root, agent: "a", modelId: "m", message: "Drifting problem.", about: "fleet", environment });
+    const copy = join(await temporaryDirectory(), "PAPERCUTS.md");
+    await writeFile(copy, await readFile(entry.file, "utf8"));
+    await resolvePapercut(entry.id, { environment, files: [entry.file], note: "Fixed once." });
+
+    const entries = await readGlobalEntries(environment);
+    const drift = await checkMarkdownCopies(entries, { environment });
+    expect(drift.map(({ file, kind, markdownStatus }) => ({ file, kind, markdownStatus }))).toEqual([
+      { file: subjectLog, kind: "status", markdownStatus: "open" },
+    ]);
+    expect((await checkMarkdownCopies(entries, { environment, files: [copy] }))[0]?.kind).toBe("status");
+
+    const fixed = await checkMarkdownCopies(entries, { environment, fix: true });
+    expect(fixed[0]?.fixed).toBe(true);
+    expect(await readFile(subjectLog, "utf8")).toContain("Fixed once.");
+    expect(await checkMarkdownCopies(entries, { environment })).toEqual([]);
   });
 
   test("finds a similar open entry for a near-duplicate message", async () => {

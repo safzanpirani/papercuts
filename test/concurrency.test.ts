@@ -4,7 +4,7 @@ import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, uti
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bumpPapercut, readGlobalEntries, recordPapercut, resolvePapercut, writeGlobalEntries, writeUniqueMirrors } from "../src/core.ts";
+import { bumpPapercut, checkMarkdownCopies, readGlobalEntries, recordPapercut, resolvePapercut, writeGlobalEntries, writeUniqueMirrors } from "../src/core.ts";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -81,7 +81,7 @@ for (const held of ["global", "markdown"]) {
 test("recovers an empty lock left by an interrupted release", async () => {
   const { root, environment, entry } = await store();
   await mkdir(`${environment.PAPERCUTS_GLOBAL_FILE}.lock`);
-  expect((await bumpPapercut(entry.id, { environment })).occurrences).toBe(2);
+  expect((await bumpPapercut(entry.id, { environment })).entry.occurrences).toBe(2);
   await expectClean(root);
 });
 
@@ -98,7 +98,7 @@ test("times out without stealing an old lock from a live process", async () => {
   expect(await readdir(lock)).toEqual([owner]);
   expect((await readGlobalEntries(environment))[0]!.occurrences).toBe(1);
   await rm(lock, { recursive: true });
-  expect((await bumpPapercut(entry.id, { environment })).occurrences).toBe(2);
+  expect((await bumpPapercut(entry.id, { environment })).entry.occurrences).toBe(2);
   await expectClean(root);
 }, 20000);
 
@@ -268,7 +268,7 @@ test("keeps JSON unchanged when a Markdown projection cannot be read", async () 
   await expectClean(root);
   await rm(entry.file, { recursive: true });
   await writeFile(entry.file, markdown);
-  expect((await bumpPapercut(entry.id, { environment })).occurrences).toBe(2);
+  expect((await bumpPapercut(entry.id, { environment })).entry.occurrences).toBe(2);
   await expectClean(root);
 });
 
@@ -288,7 +288,7 @@ test("rolls Markdown back when publishing JSON fails and releases every lock", a
   expect(await readFile(entry.file, "utf8")).toBe(before);
   expect((await readGlobalEntries(environment))[0]!.occurrences).toBe(1);
   await expectClean(root);
-  expect((await bumpPapercut(entry.id, { environment })).occurrences).toBe(2);
+  expect((await bumpPapercut(entry.id, { environment })).entry.occurrences).toBe(2);
   await expectClean(root);
 });
 
@@ -425,5 +425,29 @@ test("deduplicates primary and subject aliases during appends and lifecycle upda
   expect(markdown.match(new RegExp(`^## ${added.id} `, "gm"))).toHaveLength(1);
   expect(markdown.match(/\*\*Hit again:\*\*/g)).toHaveLength(1);
   expect((await readGlobalEntries(environment)).find((current) => current.id === added.id)!.occurrences).toBe(2);
+  await expectClean(root);
+});
+
+test("drift repair rereads lifecycle status under store and explicit-file locks", async () => {
+  const { root, environment, entry } = await store();
+  const copy = join(root, "copy.md");
+  await writeFile(copy, await readFile(entry.file, "utf8"));
+  await resolvePapercut(entry.id, { environment, files: [] });
+  const stale = await readGlobalEntries(environment);
+  await bumpPapercut(entry.id, { environment, files: [] });
+  const rename = fs.rename;
+  const acquired: string[] = [];
+  const publication = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+    await rename(from, to);
+    if (String(to).endsWith(".lock")) acquired.push(String(to));
+  });
+  try {
+    await checkMarkdownCopies(stale, { environment, files: [copy], fix: true });
+    expect(acquired).toEqual([`${copy}.lock`, `${environment.PAPERCUTS_GLOBAL_FILE}.lock`].sort());
+  } finally {
+    publication.mockRestore();
+  }
+  expect(await readFile(copy, "utf8")).not.toContain("**Resolved:**");
+  expect(await checkMarkdownCopies(await readGlobalEntries(environment), { environment, files: [copy] })).toEqual([]);
   await expectClean(root);
 });

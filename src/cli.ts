@@ -1,15 +1,17 @@
 #!/usr/bin/env bun
-import { sep } from "node:path";
+import { resolve, sep } from "node:path";
 import {
   bumpPapercut,
   CANONICAL_TAGS,
   canonicalTag,
+  checkMarkdownCopies,
   findSimilar,
   findProjectRoot,
   normalizeAbout,
   normalizeTags,
   readGlobalEntries,
   recordPapercut,
+  type LifecycleResult,
   resolveLogFile,
   resolvePapercut,
   suggestTag,
@@ -23,8 +25,9 @@ Usage:
   papercuts add [options] <message...>
   papercuts list [list options]
   papercuts top [tag|about|project|agent|model] [list options]
-  papercuts resolve <id> [--note <text>]
-  papercuts bump <id>
+  papercuts resolve <id> [--note <text>] [--file <path>... | --global-only]
+  papercuts bump <id> [--file <path>... | --global-only]
+  papercuts check [--all] [--file <path>...] [--fix]
   papercuts tags
   papercuts path [--file <path>]
 
@@ -33,8 +36,11 @@ Options:
   -m, --model <model-id>  exact model ID responsible for the entry
   -b, --about <subject>   what the friction is about (tool/CLI/service), not where
   -t, --tag <tag>         categorize the entry (repeatable, comma-separated ok)
-  -f, --file <path>       override PAPERCUTS.md destination
+  -f, --file <path>       override PAPERCUTS.md destination; with \`resolve\`,
+                          \`bump\`, and \`check\`, act on only these logs (repeatable)
+      --global-only       \`resolve\`/\`bump\` update only the global mirror
       --note <text>       resolution note (with \`resolve\`)
+      --fix               \`check\` appends the missing lifecycle bullet to drifted copies
       --json              print JSON instead of text
   -h, --help              show this help
 
@@ -51,7 +57,8 @@ Entries go to PAPERCUTS.md at the enclosing Git root (or the current directory
 outside a Git project) and are mirrored to ~/.papercuts/global.jsonl, which
 \`list\`, \`top\`, \`resolve\`, and \`bump\` read. Map a subject to the repo that owns
 it in ~/.papercuts/subjects.json ({"fleet": "/path/to/fleet"}) and --about also
-files the entry there. PAPERCUTS_AGENT, PAPERCUTS_MODEL_ID, PAPERCUTS_FILE, and
+files the entry there. \`resolve\` and \`bump\` annotate every known Markdown copy
+(the original log and the subject log); \`check\` reports copies that drifted. PAPERCUTS_AGENT, PAPERCUTS_MODEL_ID, PAPERCUTS_FILE, and
 PAPERCUTS_GLOBAL_FILE (set to "off" to disable the mirror) override defaults.`;
 
 function fail(message: string): never {
@@ -59,7 +66,7 @@ function fail(message: string): never {
   process.exit(1);
 }
 
-type Command = "add" | "path" | "list" | "top" | "resolve" | "bump" | "tags" | "help";
+type Command = "add" | "path" | "list" | "top" | "resolve" | "bump" | "check" | "tags" | "help";
 type StatusFilter = "open" | "resolved" | "any";
 
 interface ParsedArgs {
@@ -70,6 +77,9 @@ interface ParsedArgs {
   about?: string;
   tags: string[];
   file?: string;
+  files: string[];
+  globalOnly: boolean;
+  fix: boolean;
   note?: string;
   json: boolean;
   all: boolean;
@@ -79,7 +89,7 @@ interface ParsedArgs {
   positionals: string[];
 }
 
-const COMMANDS = new Set(["add", "path", "list", "top", "resolve", "bump", "tags", "help"]);
+const COMMANDS = new Set(["add", "path", "list", "top", "resolve", "bump", "check", "tags", "help"]);
 
 function parseArgs(argv: string[]): ParsedArgs {
   const args = [...argv];
@@ -87,6 +97,9 @@ function parseArgs(argv: string[]): ParsedArgs {
     command: "add",
     message: "",
     tags: [],
+    files: [],
+    globalOnly: false,
+    fix: false,
     json: false,
     all: false,
     positionals: [],
@@ -110,6 +123,14 @@ function parseArgs(argv: string[]): ParsedArgs {
     if (arg === "-h" || arg === "--help") return { ...parsed, command: "help", message: "" };
     if (arg === "--json") {
       parsed.json = true;
+      continue;
+    }
+    if (arg === "--global-only") {
+      parsed.globalOnly = true;
+      continue;
+    }
+    if (arg === "--fix") {
+      parsed.fix = true;
       continue;
     }
     if (arg === "--all") {
@@ -147,6 +168,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
     if (arg === "-f" || arg === "--file") {
       parsed.file = args[++index] ?? fail(`${arg} requires a value`);
+      parsed.files.push(parsed.file);
       continue;
     }
     if (arg === "-n" || arg === "--limit") {
@@ -338,6 +360,53 @@ async function runAdd(parsed: ParsedArgs): Promise<void> {
   }
 }
 
+/** Markdown logs a lifecycle command may touch: --file narrows, --global-only empties. */
+function lifecycleFiles(parsed: ParsedArgs): string[] | undefined {
+  if (parsed.globalOnly && parsed.files.length) fail("--global-only and --file cannot be combined");
+  if (parsed.globalOnly) return [];
+  return parsed.files.length ? parsed.files.map((file) => resolve(file)) : undefined;
+}
+
+function reportLifecycle(parsed: ParsedArgs, verb: string, result: LifecycleResult): void {
+  if (parsed.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  const { entry, annotated, missed } = result;
+  const count = verb === "Bumped" ? ` to ×${entry.occurrences}` : "";
+  console.log(`✓ ${verb} ${entry.id}${count} in the global mirror`);
+  for (const file of annotated) console.log(`  annotated ${file}`);
+  for (const file of missed) console.error(`! ${entry.id} not found in ${file}; pass --file <path> to annotate a moved copy`);
+  if (!annotated.length && !missed.length) console.log("  no Markdown logs touched (--global-only)");
+}
+
+async function runCheck(parsed: ParsedArgs): Promise<void> {
+  const files = parsed.files.length ? parsed.files.map((file) => resolve(file)) : undefined;
+  // An explicit file is checked against every entry it holds, wherever it was filed.
+  const entries = files ? await readGlobalEntries() : await selectEntries({ ...parsed, status: "any" });
+  const drift = await checkMarkdownCopies(entries, { files, fix: parsed.fix });
+
+  if (parsed.json) {
+    console.log(JSON.stringify(drift.map(({ entry, ...rest }) => ({ ...rest, id: entry?.id, status: entry?.status })), null, 2));
+    return;
+  }
+  if (!drift.length) {
+    console.log("✓ Markdown copies agree with the global mirror.");
+    return;
+  }
+  for (const item of drift) {
+    const id = item.entry?.id ?? "------";
+    if (item.kind === "status") {
+      const action = item.fixed ? "fixed" : parsed.fix ? "not fixable" : "drift";
+      console.log(`${id}  ${action}: mirror says ${item.entry!.status}, Markdown says ${item.markdownStatus}  ${item.file}`);
+    } else {
+      console.log(`${id}  ${item.kind}  ${item.file}`);
+    }
+  }
+  const unfixed = drift.filter((item) => item.kind === "status" && !item.fixed).length;
+  if (unfixed && !parsed.fix) console.log(`\n${unfixed} status drift(s); rerun with --fix to append the missing bullets.`);
+}
+
 async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
   switch (parsed.command) {
@@ -358,18 +427,17 @@ async function main(): Promise<void> {
       return;
     case "resolve": {
       const id = parsed.positionals[0] ?? fail("resolve requires a papercut ID");
-      const entry = await resolvePapercut(id, { note: parsed.note });
-      console.log(parsed.json ? JSON.stringify(entry, null, 2) : `✓ Resolved ${entry.id} (${entry.file})`);
+      reportLifecycle(parsed, "Resolved", await resolvePapercut(id, { note: parsed.note, files: lifecycleFiles(parsed) }));
       return;
     }
     case "bump": {
       const id = parsed.positionals[0] ?? fail("bump requires a papercut ID");
-      const entry = await bumpPapercut(id);
-      console.log(
-        parsed.json ? JSON.stringify(entry, null, 2) : `✓ Bumped ${entry.id} to ×${entry.occurrences}`,
-      );
+      reportLifecycle(parsed, "Bumped", await bumpPapercut(id, { files: lifecycleFiles(parsed) }));
       return;
     }
+    case "check":
+      await runCheck(parsed);
+      return;
     case "add":
       await runAdd(parsed);
       return;
