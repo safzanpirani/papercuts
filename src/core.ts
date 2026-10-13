@@ -3,7 +3,7 @@ import { existsSync, createReadStream } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { homedir } from "node:os";
-import { dirname, join, parse, resolve } from "node:path";
+import { basename, dirname, join, parse, resolve } from "node:path";
 
 export const LOG_NAME = "PAPERCUTS.md";
 const TRANSCRIPT_STAT_PARALLELISM = 8;
@@ -413,11 +413,9 @@ async function recoverFileLock(lock: string): Promise<void> {
   }
 }
 
-/** Cooperating processes acquire the global lock before any Markdown locks.
- * Publish a nonempty directory so death during initialization cannot leave a
+/** Publish a nonempty directory so death during initialization cannot leave a
  * lock without its PID. Never expire a live owner merely because it is slow. */
 async function withFileLock<T>(file: string, run: () => Promise<T>): Promise<T> {
-  // TODO(astra): Define support for stores that swap global and Markdown paths; global-first ordering can time out.
   const lock = `${resolve(file)}.lock`;
   await mkdir(dirname(lock), { recursive: true });
   const token = randomUUID();
@@ -453,8 +451,22 @@ async function withFileLock<T>(file: string, run: () => Promise<T>): Promise<T> 
   }
 }
 
-async function withMarkdownLocks<T>(files: string[], run: () => Promise<T>): Promise<T> {
-  const unique = [...new Set(files.map((file) => resolve(file)))].sort();
+/** Existing symlinks and aliased parent directories share one lock identity. */
+async function destinationPath(file: string): Promise<string> {
+  const absolute = resolve(file);
+  try {
+    return await realpath(absolute);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    const parent = dirname(absolute);
+    if (parent === absolute) throw error;
+    return join(await destinationPath(parent), basename(absolute));
+  }
+}
+
+/** Acquire every destination in the same order, regardless of its store role. */
+async function withFileLocks<T>(files: string[], run: () => Promise<T>): Promise<T> {
+  const unique = [...new Set(await Promise.all(files.map(destinationPath)))].sort();
   const acquire = (index: number): Promise<T> => index === unique.length
     ? run()
     : withFileLock(unique[index]!, () => acquire(index + 1));
@@ -502,7 +514,7 @@ export async function writeGlobalEntries(
 ): Promise<void> {
   const globalFile = resolveGlobalFile(environment);
   if (!globalFile) throw new Error("global mirror is disabled; nothing to update");
-  await withFileLock(globalFile, () => atomicWrite(globalFile, globalContent(entries)));
+  await withFileLocks([globalFile], () => atomicWrite(globalFile, globalContent(entries)));
 }
 
 const STOPWORDS = new Set(
@@ -558,7 +570,7 @@ export async function annotateMarkdownEntry(
   entry: Papercut,
   bullets: string[],
 ): Promise<boolean> {
-  return withFileLock(file, async () => {
+  return withFileLocks([file], async () => {
     const content = await readMarkdown(file);
     if (content === undefined) return false;
     const updated = annotatedMarkdown(content, entry, bullets);
@@ -604,18 +616,33 @@ async function updateEntry(
 ): Promise<Papercut> {
   const globalFile = resolveGlobalFile(environment);
   if (!globalFile) throw new Error("global mirror is disabled; nothing to update");
-  return withFileLock(globalFile, async () => {
+  const readTarget = async () => {
     const entries = await readGlobalEntries(environment);
     const matches = entries.filter((entry) => entry.id === id || entry.id.startsWith(id));
     if (!matches.length) throw new Error(`no papercut with ID ${id}`);
     if (matches.length > 1) throw new Error(`ID ${id} is ambiguous (${matches.map((e) => e.id).join(", ")})`);
-
-    const target = matches[0]!;
-    const { entry, bullets } = apply(target);
-    const subjectFile = await subjectLogFile(entry.about, environment);
-    const files = [...new Set([entry.file, ...(subjectFile ? [subjectFile] : [])].map((file) => resolve(file)))];
-    if (files.includes(resolve(globalFile))) throw new Error("global mirror cannot also be a Markdown log");
-    return withMarkdownLocks(files, async () => {
+    return { entries, target: matches[0]! };
+  };
+  while (true) {
+    // Discover destinations without holding a lock, then re-read under the full
+    // ordered lock set. No lifecycle state is calculated from this snapshot.
+    const snapshot = await readTarget();
+    const subjectFile = await subjectLogFile(snapshot.target.about, environment);
+    const files = [...new Set(await Promise.all([
+      snapshot.target.file, ...(subjectFile ? [subjectFile] : []),
+    ].map(destinationPath)))];
+    const globalPath = await destinationPath(globalFile);
+    if (files.includes(globalPath)) throw new Error("global mirror cannot also be a Markdown log");
+    const result = await withFileLocks([globalPath, ...files], async () => {
+      const { entries, target } = await readTarget();
+      const currentSubject = await subjectLogFile(target.about, environment);
+      const currentFiles = [...new Set(await Promise.all([
+        target.file, ...(currentSubject ? [currentSubject] : []),
+      ].map(destinationPath)))];
+      // A cooperating full-store replacement may change an entry's destinations.
+      // Release and rediscover instead of acquiring more locks out of order.
+      if (currentFiles.length !== files.length || currentFiles.some((file) => !files.includes(file))) return undefined;
+      const { entry, bullets } = apply(target);
       const changes: { file: string; before: string; after: string }[] = [];
       for (const file of files) {
         const before = await readMarkdown(file);
@@ -646,7 +673,8 @@ async function updateEntry(
       }
       return entry;
     });
-  });
+    if (result) return result;
+  }
 }
 
 export async function resolvePapercut(
@@ -729,10 +757,6 @@ async function subjectLogFile(
   }
 }
 
-async function appendMarkdownLog(file: string, text: string): Promise<void> {
-  return withFileLock(file, () => appendMarkdownLogUnlocked(file, text));
-}
-
 async function appendMarkdownLogUnlocked(file: string, text: string): Promise<void> {
   await mkdir(dirname(file), { recursive: true });
   try {
@@ -808,37 +832,31 @@ export async function recordPapercut(options: {
   const text = formatEntry(entry);
   const globalFile = resolveGlobalFile(environment);
   const subjectFile = await subjectLogFile(entry.about, environment);
-  const write = async () => {
-    await appendMarkdownLog(file, text);
+  const primary = await destinationPath(file);
+  const subjectPath = subjectFile ? await destinationPath(subjectFile) : undefined;
+  const globalPath = globalFile ? await destinationPath(globalFile) : undefined;
+  await withFileLocks([primary, ...(subjectPath ? [subjectPath] : []), ...(globalPath ? [globalPath] : [])], async () => {
+    await appendMarkdownLogUnlocked(primary, text);
 
-    const primary = resolve(file);
     const mirrors: MirrorWrite[] = [];
-    if (subjectFile && resolve(subjectFile) !== primary) {
+    if (subjectPath && subjectPath !== primary) {
       mirrors.push({
-        file: subjectFile,
-        write: () => appendMarkdownLog(subjectFile, text),
+        file: subjectPath,
+        write: () => appendMarkdownLogUnlocked(subjectPath, text),
       });
     }
 
-    if (globalFile && resolve(globalFile) !== primary) {
+    if (globalPath && globalPath !== primary) {
       mirrors.push({
-        file: globalFile,
+        file: globalPath,
         write: async () => {
-          await mkdir(dirname(globalFile), { recursive: true });
-          await appendFile(globalFile, `${JSON.stringify(entry)}\n`, "utf8");
+          await mkdir(dirname(globalPath), { recursive: true });
+          await appendFile(globalPath, `${JSON.stringify(entry)}\n`, "utf8");
         },
       });
     }
     await writeUniqueMirrors(mirrors);
-  };
-  // The store lock covers the primary append and all mirrors, so lifecycle
-  // rewrites cannot replace a snapshot taken before an append completed.
-  // A global/Markdown collision already uses the Markdown destination's lock.
-  if (globalFile && globalFile !== resolve(file) && globalFile !== (subjectFile && resolve(subjectFile))) {
-    await withFileLock(globalFile, write);
-  } else {
-    await write();
-  }
+  });
 
   return entry;
 }

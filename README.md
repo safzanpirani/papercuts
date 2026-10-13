@@ -121,15 +121,17 @@ Use `--file` or `PAPERCUTS_FILE` to override the per-project destination. Use
 `PAPERCUTS_GLOBAL_FILE` to relocate the cross-project mirror, or set it to
 `off` to disable mirroring. Papercuts always completes the primary Markdown append
 first. After that succeeds, it writes distinct subject and global mirror destinations
-concurrently. Duplicate resolved paths receive one write, which prevents a subject map
-and global override from double-appending the same file. Lifecycle updates such as
-`resolve` and `bump` remain serial read-modify-write operations.
+concurrently. Duplicate canonical destinations, including symlink aliases, receive
+one write. Lifecycle updates such as `resolve` and `bump` read their current state
+under the same destination locks before publishing changes.
 
-Concurrent writers use process-shared locks. A lock records its process ID and
-a unique ownership token. Later writers recover locks after the owner exits.
-Waiters fail after ten seconds if the owner stays alive; they never evict a slow
-live writer. Locks require cooperating clients on the same host and consistent
-destination paths. Older clients do not participate in this protocol.
+Concurrent writers use process-shared locks, acquiring every destination in sorted
+canonical-path order to avoid cycles between stores. Existing symlinks and aliased
+parent directories share a lock, while log symlinks and permissions are preserved.
+A lock records its process ID and a unique ownership token. Later writers recover
+locks after the owner exits. Waiters fail after ten seconds if the owner stays alive;
+they never evict a slow live writer. Locks require cooperating clients on the same
+host. Older clients and external editors do not participate in this protocol.
 
 Lifecycle updates publish Markdown before JSON and attempt rollback on ordinary
 write failures. A process kill can interrupt a multi-file update and leave

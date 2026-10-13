@@ -12,7 +12,7 @@ afterEach(async () => {
 });
 
 async function store(about?: string) {
-  const root = await mkdtemp(join(tmpdir(), "papercuts-concurrency-"));
+  const root = await fs.realpath(await mkdtemp(join(tmpdir(), "papercuts-concurrency-")));
   roots.push(root);
   const environment = { HOME: root, PAPERCUTS_GLOBAL_FILE: join(root, "global.jsonl") };
   if (about) {
@@ -35,11 +35,12 @@ for (const held of ["global", "markdown"]) {
     const worker = `
       import { spyOn } from 'bun:test';
       import * as fs from 'node:fs/promises';
+      import { existsSync } from 'node:fs';
       import { bumpPapercut } from ${JSON.stringify(new URL("../src/core.ts", import.meta.url).pathname)};
       const [root, id, blocked] = process.argv.slice(1);
       const read = fs.readFile;
       spyOn(fs, 'readFile').mockImplementation(async (...args) => {
-        if (args[0] === blocked) {
+        if (existsSync(args[0] + '.lock') && await fs.realpath(args[0]) === await fs.realpath(blocked)) {
           console.log('locked');
           await Bun.stdin.text();
         }
@@ -105,7 +106,7 @@ test("a delayed stale-lock reclaimer cannot remove a successor's ownership", asy
   const { root, environment, entry } = await store();
   const child = Bun.spawn({ cmd: [process.execPath, "-e", ""], stdout: "ignore", stderr: "ignore" });
   expect(await child.exited).toBe(0);
-  const lock = `${environment.PAPERCUTS_GLOBAL_FILE}.lock`;
+  const lock = `${[entry.file, environment.PAPERCUTS_GLOBAL_FILE].sort()[0]}.lock`;
   const marker = join(lock, `owner-${child.pid}-${randomUUID()}`);
   await mkdir(marker, { recursive: true });
   const bothReclaimers = Promise.withResolvers<void>();
@@ -158,12 +159,16 @@ test("preserves two simultaneous bumps in one process", async () => {
   await expectClean(root);
 });
 
-test("coordinates appends, bumps and resolutions across two processes", async () => {
+test("coordinates appends, bumps and resolutions across processes using symlink aliases", async () => {
   const { root, environment, entry } = await store("tool");
+  const alias = `${root}-alias`;
+  roots.push(alias);
+  await symlink(root, alias);
+  await symlink("global.jsonl", join(root, "mirror.jsonl"));
   const worker = `
     import { recordPapercut, bumpPapercut, resolvePapercut } from ${JSON.stringify(new URL("../src/core.ts", import.meta.url).pathname)};
     const [root, id, worker] = process.argv.slice(1);
-    const environment = { HOME: root, PAPERCUTS_GLOBAL_FILE: root + '/global.jsonl' };
+    const environment = { HOME: root, PAPERCUTS_GLOBAL_FILE: root + (worker === 'b' ? '/mirror.jsonl' : '/global.jsonl') };
     console.log('ready');
     await Bun.stdin.text();
     for (let i = 0; i < 12; i++) {
@@ -174,7 +179,7 @@ test("coordinates appends, bumps and resolutions across two processes", async ()
     }
   `;
   const children = ["a", "b"].map((name) => Bun.spawn({
-    cmd: [process.execPath, "--no-env-file", "-e", worker, root, entry.id, name],
+    cmd: [process.execPath, "--no-env-file", "-e", worker, name === "b" ? alias : root, entry.id, name],
     stdin: "pipe", stdout: "pipe", stderr: "pipe",
   }));
   try {
@@ -382,5 +387,43 @@ test("preserves an unowned temporary file when exclusive creation collides", asy
   expect(await readFile(collision!, "utf8")).toBe("another writer owns this file");
   expect(await readGlobalEntries(environment)).toEqual([entry]);
   await rm(collision!);
+  await expectClean(root);
+});
+
+test("locks all destinations in canonical order for appends and lifecycle updates", async () => {
+  const { root, environment, options, entry } = await store("tool");
+  const rename = fs.rename;
+  const acquired: string[] = [];
+  const publication = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+    await rename(from, to);
+    if (String(to).endsWith(".lock")) acquired.push(String(to));
+  });
+  const expected = (await Promise.all([entry.file, environment.PAPERCUTS_GLOBAL_FILE, join(root, "subject", "PAPERCUTS.md")]
+    .map((file) => fs.realpath(file)))).map((file) => `${file}.lock`).sort();
+  try {
+    await recordPapercut({ ...options, message: "Synthetic ordered-lock entry." });
+    expect(acquired).toEqual(expected);
+    acquired.length = 0;
+    await bumpPapercut(entry.id, { environment });
+    expect(acquired).toEqual(expected);
+  } finally {
+    publication.mockRestore();
+  }
+  await expectClean(root);
+});
+
+test("deduplicates primary and subject aliases during appends and lifecycle updates", async () => {
+  const { root, options, environment, entry } = await store();
+  await mkdir(join(root, ".papercuts"));
+  const alias = `${root}-alias`;
+  roots.push(alias);
+  await symlink(root, alias);
+  await writeFile(join(root, ".papercuts", "subjects.json"), JSON.stringify({ tool: alias }));
+  const added = await recordPapercut({ ...options, about: "tool", message: "Synthetic aliased subject." });
+  await bumpPapercut(added.id, { environment });
+  const markdown = await readFile(entry.file, "utf8");
+  expect(markdown.match(new RegExp(`^## ${added.id} `, "gm"))).toHaveLength(1);
+  expect(markdown.match(/\*\*Hit again:\*\*/g)).toHaveLength(1);
+  expect((await readGlobalEntries(environment)).find((current) => current.id === added.id)!.occurrences).toBe(2);
   await expectClean(root);
 });
