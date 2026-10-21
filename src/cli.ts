@@ -5,6 +5,7 @@ import {
   CANONICAL_TAGS,
   canonicalTag,
   checkMarkdownCopies,
+  findPapercut,
   findSimilar,
   findProjectRoot,
   normalizeAbout,
@@ -25,6 +26,7 @@ Usage:
   papercuts add [options] <message...>
   papercuts list [list options]
   papercuts top [tag|about|project|agent|model] [list options]
+  papercuts show <id> [--json]
   papercuts resolve <id> [--note <text>] [--file <path>... | --global-only]
   papercuts bump <id> [--file <path>... | --global-only]
   papercuts check [--all] [--file <path>...] [--fix]
@@ -55,7 +57,7 @@ List options:
 
 Entries go to PAPERCUTS.md at the enclosing Git root (or the current directory
 outside a Git project) and are mirrored to ~/.papercuts/global.jsonl, which
-\`list\`, \`top\`, \`resolve\`, and \`bump\` read. Map a subject to the repo that owns
+\`list\`, \`top\`, \`show\`, \`resolve\`, and \`bump\` read. Map a subject to the repo that owns
 it in ~/.papercuts/subjects.json ({"fleet": "/path/to/fleet"}) and --about also
 files the entry there. \`resolve\` and \`bump\` annotate every known Markdown copy
 (the original log and the subject log); \`check\` reports copies that drifted. PAPERCUTS_AGENT, PAPERCUTS_MODEL_ID, PAPERCUTS_FILE, and
@@ -66,7 +68,7 @@ function fail(message: string): never {
   process.exit(1);
 }
 
-type Command = "add" | "path" | "list" | "top" | "resolve" | "bump" | "check" | "tags" | "help";
+type Command = "add" | "path" | "list" | "top" | "show" | "resolve" | "bump" | "check" | "tags" | "help";
 type StatusFilter = "open" | "resolved" | "any";
 
 interface ParsedArgs {
@@ -89,7 +91,7 @@ interface ParsedArgs {
   positionals: string[];
 }
 
-const COMMANDS = new Set(["add", "path", "list", "top", "resolve", "bump", "check", "tags", "help"]);
+const COMMANDS = new Set(["add", "path", "list", "top", "show", "resolve", "bump", "check", "tags", "help"]);
 
 function parseArgs(argv: string[]): ParsedArgs {
   const args = [...argv];
@@ -258,6 +260,26 @@ async function runList(parsed: ParsedArgs): Promise<void> {
   }
 }
 
+async function runShow(parsed: ParsedArgs): Promise<void> {
+  const id = parsed.positionals[0] ?? fail("show requires a papercut ID");
+  const entry = findPapercut(await readGlobalEntries(), id);
+  if (parsed.json) {
+    console.log(JSON.stringify(entry, null, 2));
+    return;
+  }
+  const bits = [entry.about ? `about:${entry.about}` : undefined, ...entry.tags].filter(Boolean);
+  const lines = [
+    `${entry.id}  ${entry.timestamp}  ${entry.agent} — ${entry.modelId}`,
+    `  status:    ${entry.status}${entry.occurrences > 1 ? `  ×${entry.occurrences}` : ""}`,
+    `  directory: ${entry.directory}`,
+    `  log:       ${entry.file}`,
+  ];
+  if (bits.length) lines.push(`  tags:      ${bits.join(", ")}`);
+  if (entry.lastSeen) lines.push(`  last seen: ${entry.lastSeen}`);
+  if (entry.resolvedAt) lines.push(`  resolved:  ${entry.resolvedAt}${entry.resolution ? ` — ${entry.resolution}` : ""}`);
+  console.log([...lines, "", entry.message].join("\n"));
+}
+
 const GROUPERS: Record<string, (entry: Papercut) => string[]> = {
   tag: (entry) => (entry.tags.length ? entry.tags.map(canonicalTag) : ["(untagged)"]),
   about: (entry) => [entry.about ?? "(unset)"],
@@ -421,6 +443,9 @@ async function main(): Promise<void> {
       return;
     case "top":
       await runTop(parsed);
+      return;
+    case "show":
+      await runShow(parsed);
       return;
     case "tags":
       await runTags(parsed);

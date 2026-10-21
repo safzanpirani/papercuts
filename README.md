@@ -78,6 +78,7 @@ papercuts list -b fleet --all  # everything logged about one tool
 papercuts top about --all      # what recurs most, by subject
 papercuts top tag --all -n 10
 papercuts tags                 # canonical vocabulary + what's in use
+papercuts show 29558a          # one entry in full (--json for machine-readable)
 papercuts bump 29558a          # hit the same friction again
 papercuts resolve 29558a --note "Added a targeted error in cli.ts."
 papercuts resolve 29558a --file ../renamed/PAPERCUTS.md   # annotate a moved copy

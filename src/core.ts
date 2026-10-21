@@ -666,6 +666,14 @@ export interface LifecycleResult {
   missed: string[];
 }
 
+/** Looks up one entry by full ID or unique ID prefix. */
+export function findPapercut(entries: Papercut[], id: string): Papercut {
+  const matches = entries.filter((entry) => entry.id.startsWith(id));
+  if (!matches.length) throw new Error(`no papercut with ID ${id}`);
+  if (matches.length > 1) throw new Error(`ID ${id} is ambiguous (${matches.map((e) => e.id).join(", ")})`);
+  return matches[0]!;
+}
+
 async function updateEntry(
   id: string,
   apply: (entry: Papercut) => { entry: Papercut; bullets: string[] },
@@ -676,10 +684,7 @@ async function updateEntry(
   if (!globalFile) throw new Error("global mirror is disabled; nothing to update");
   const readTarget = async () => {
     const entries = await readGlobalEntries(environment);
-    const matches = entries.filter((entry) => entry.id === id || entry.id.startsWith(id));
-    if (!matches.length) throw new Error(`no papercut with ID ${id}`);
-    if (matches.length > 1) throw new Error(`ID ${id} is ambiguous (${matches.map((e) => e.id).join(", ")})`);
-    return { entries, target: matches[0]! };
+    return { entries, target: findPapercut(entries, id) };
   };
   while (true) {
     // Discover destinations, then re-read lifecycle state under the full lock set.
