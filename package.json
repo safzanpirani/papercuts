@@ -23,11 +23,10 @@
     "papercuts": "bun run src/cli.ts",
     "build": "bun build --compile src/cli.ts --outfile dist/papercuts",
     "test": "bun test",
-    "typecheck": "tsrs --noEmit"
+    "typecheck": "bun --check"
   },
   "devDependencies": {
     "@types/bun": "latest",
-    "tsrs": "0.16.0-ts7.1.0-dev.20260929",
     "typescript": "^5"
   }
 }
